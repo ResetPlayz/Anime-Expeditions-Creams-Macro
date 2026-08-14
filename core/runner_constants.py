@@ -80,6 +80,66 @@ PLAY_CLICK_RETRY_ATTEMPTS = 3
 START_GAME_CLICK_RETRY_ATTEMPTS = 3
 START_GAME_CLICK_VERIFY_SETTLE = 1.0  # after clicking, how long to wait before checking it's actually gone
 START_GAME_BUTTON_WAIT_TIMEOUT = 5.0  # how long to poll for Start Game right after Pre Start hands off
+# ── Native Expedition encounter handling (_handle_expedition_encounter).
+# An encounter node parks the client somewhere a match result can never come
+# from. Recovering means: reset position, walk to that map's NPC, talk to it.
+# All coordinates are in the 1152x756 reference space, measured on a real
+# client -- the same kind of constant as STORY_CLICK. Where an image exists for
+# a step it is used instead (nav_settings / nav_closeui are already shipped),
+# because an image survives a layout shift and a coordinate does not.
+ENCOUNTER_REGION = (414, 58, 41, 45)      # the encounter marker's HUD slot
+ENCOUNTER_TELEPORT_SPAWN_CLICK = (621, 443)  # "teleport to spawn" inside Settings
+# Dialogue advance clicks, in order. The prompt is opened with E; these step
+# through the exchange that follows.
+ENCOUNTER_DIALOGUE_CLICKS = ((403, 663), (581, 577), (667, 665), (581, 577))
+ENCOUNTER_STEP_SETTLE = 0.3        # between UI steps, so each registers
+ENCOUNTER_ARRIVE_SETTLE = 1.5      # after the walk, before looking for the prompt
+ENCOUNTER_SPEAK_TIMEOUT = 4.0      # how long to wait for the interact prompt
+# Opening Settings is the step most likely to be blocked: a level-up "Select an
+# upgrade!" modal renders over the gear, so the search legitimately fails while
+# one is up. Longer than the others, and the modal is cleared first.
+ENCOUNTER_SETTINGS_TIMEOUT = 6.0
+# A level-up "Select an upgrade!" modal covers the settings gear, and several
+# can queue up back to back after a wave. Clearing one and pressing on is not
+# enough -- the next is already rendering. Wait until none is left, up to this
+# long, dismissing each as it appears. Bounded rather than a flat sleep, so a
+# run with nothing blocking pays nothing.
+ENCOUNTER_MODAL_CLEAR_TIMEOUT = 12.0
+ENCOUNTER_MODAL_POLL = 0.4
+# Closing Settings took more than one click in practice: observed closing on
+# the second attempt roughly as often as the first.
+ENCOUNTER_CLOSE_ATTEMPTS = 3
+# The dialogue is several boxes, not one. Firing the click sequence once and
+# moving on left the run standing in an open box, so it repeats until the
+# interact prompt is gone -- bounded, because a dialogue that never clears is
+# a different problem and should not loop forever.
+ENCOUNTER_DIALOGUE_ROUNDS = 3
+# One second between dialogue clicks, matching the spacing the template version
+# actually ran at: each Click block there advances on its own battle tick, and
+# MATCH_RESULT_POLL_INTERVAL is 1.0s. Firing them back to back instead landed
+# clicks on a box that had not advanced yet -- same coordinates, wrong pace.
+ENCOUNTER_DIALOGUE_CLICK_GAP = 1.0
+# Two separate pauses, because they wait on different things.
+#
+# The first is before ANY of the menu work: the encounter has just appeared,
+# the wave that triggered it is still resolving, and level-up cards are still
+# queueing. Reaching for Settings into that is what produced the alternating
+# "nav_settings not found" / "Settings is still open" failures.
+#
+# DEFERRED, never slept: the handler returns and lets the caller's poll loop
+# carry on picking upgrade cards and clicking wave Continues, and only starts
+# the menu once this much has passed since the icon first appeared. A blocking
+# wait here froze the whole run -- reward cards auto-selected untouched.
+ENCOUNTER_PRE_MENU_SETTLE = 20.0
+# The second is after the teleport, before replaying the route: the world is
+# reloading around the player and keys pressed through that are lost, so the
+# route would start part-way in and land short of the NPC. Short, because the
+# 20s above has already absorbed the encounter settling.
+ENCOUNTER_TELEPORT_SETTLE = 3.0
+# Do not re-enter while the marker is still fading, and never twice in a row
+# for one encounter.
+ENCOUNTER_COOLDOWN = 20.0
+
 EXPEDITION_WAVE_TIMEOUT = 8.0  # how long to wait for Continue_2/extract after clicking exp_continue/exp_extract
 # A level-up "Select an upgrade!" reward modal can be on screen at the exact
 # same moment as the extract/continue choice (confirmed via a real capture:
@@ -92,6 +152,25 @@ EXPEDITION_WAVE_TIMEOUT = 8.0  # how long to wait for Continue_2/extract after c
 EXPEDITION_EXTRACT_CONFIRM_TIMEOUT = 16.0
 EXTRACT_CONFIRM_SETTLE = 5.0  # settle after clicking "extract" -- reported as a click that can visually land without registering
 EXPEDITION_CONTINUE_COOLDOWN = 5.0  # settle after exp_continue/continue_2 -- a lingering banner right after the
+# How long a checkpoint may stay up, being re-found and re-clicked on every
+# poll, before the run is treated as stalled rather than progressing. Every
+# individual step of the checkpoint chain is already bounded, but nothing
+# noticed the WHOLE chain repeating: a Continue that never clears is
+# re-clicked every poll, and the only escape was MATCH_RESULT_TIMEOUT half
+# an hour later. A healthy run cannot trip this -- waves are minutes apart,
+# so the polls between two checkpoints find no Continue at all and reset
+# the clock. Only a checkpoint that never clears keeps it running.
+# Measured in elapsed time rather than poll count so it means the same
+# thing regardless of how long each retry cycle happens to take.
+EXPEDITION_STALL_TIMEOUT = 300.0
+# A Start Game popup or a level-up reward card is handled BEFORE the
+# checkpoint is looked at, and that poll returns early -- so those polls see
+# no checkpoint either way. They must not age the stall clock above (the
+# checkpoint may have cleared while they were in the way, unobserved), but a
+# run that never gets past them is not progressing either, so they get their
+# own cap rather than resetting anything. Kept separate so the log can say
+# which of the two actually happened.
+EXPEDITION_INTERCEPT_TIMEOUT = 300.0
 
 # ── Color-based Expedition checkpoint detection (the default engine --
 # Settings > Debug > "Expedition Color Detection" toggles back to the
@@ -231,6 +310,12 @@ TOURNAMENT_TYPE_IMAGES = {
     "Solo Tournament": ("solo_tournament",),
 }
 TOURNAMENT_SCREEN_TIMEOUT = 10.0  # how long to wait for each Tournament screen (nav_tournament / the type card / nav_entertournament) to appear
+TOWER_SCREEN_TIMEOUT = 10.0  # how long to wait for each Tower screen (nav_tower / Traitless_Tower / nav_select_stage) to appear
+
+# Reference-window region (x, y, w, h) of the Tower game mode.
+# The tower's recent floor is always in this region but it is
+# subject to change
+TOWER_CARD_REGION = (565, 230, 770 - 565, 351 - 230)  # (565, 230) -> (770, 351)
 
 # Auto Bounty derives all objective clicks from the live board. These values
 # only bound waits and the board's outer scroll gesture.
@@ -251,6 +336,12 @@ BOUNTY_SUMMON_MAX_BATCHES_PER_START = 20
 BOUNTY_SUMMON_NAV_TIMEOUT = 12.0
 BOUNTY_SUMMON_ANIMATION_DELAY = 3.0
 BOUNTY_SUMMON_MENU_SETTLE = 1.5
+BOUNTY_MYTHIC_DEFAULT_REROLLS = 20
+BOUNTY_MYTHIC_MIN_REROLLS = 1
+BOUNTY_MYTHIC_MAX_REROLLS = 100
+BOUNTY_MYTHIC_REROLL_SETTLE = 0.8
+BOUNTY_MYTHIC_REROLL_VERIFY_TIMEOUT = 4.0
+BOUNTY_MYTHIC_REROLL_POLL = 0.25
 
 # Villian Invasion Act 4 ("Crow - Dawn") relic gate. DROP_RELIC_IMAGE is the
 # Crow Relic reward shown on the Victory screen (relics only drop on a win) --
@@ -275,16 +366,41 @@ SPECIAL_STAGES_NO_DIFFICULTY = ("Infinite", "Mastery")
 EXPEDITION_MAP_IMAGES = {
     "Flower Forest": "expedition_flower_forest",
     "Rose Kingdom": "expedition_rose_kingdom",
+    "East Town": "expedition_east_town",
 }
 # Regular Challenge is Story's own flow, just with the game picking a
-# random one of these 5 maps for you instead of you picking it -- so
+# random one of these maps for you instead of you picking it -- so
 # there's no map-select step to skip past, only a "which map did it land
-# on" check once you're in. Reference images live in Assets/ui/<map>.png
+# on" check once you're in. A map missing from this list is simply never
+# recognized, so the run stalls on CHALLENGE_MAP_DETECT_TIMEOUT after
+# teleporting in. Reference images live in Assets/ui/<map>.png
 # (a different folder/purpose than Assets/maps/<map>.png, which is the
 # scrolling map-CARD search used to pick a map by hand -- these instead
 # confirm which map is already showing). Mirrors main.py's
 # CHALLENGE_STORY_MAPS and ui/app.js's TASK_DATA.story.maps.
-CHALLENGE_STORY_MAPS = ["School Grounds", "Rose Kingdom", "Fairy King Forest", "King's Tomb", "Flower Forest"]
+CHALLENGE_STORY_MAPS = ["School Grounds", "Rose Kingdom", "Fairy King Forest", "King's Tomb", "Flower Forest", "East Town"]
+# Daily Challenge shows its map as a ~10px label rather than the art the
+# image search above needs, so _detect_challenge_map_ocr falls back to
+# reading it. One distinctive lowercase word per map, fuzzy-matched against
+# the OCRed tokens -- a map missing an alias can never be named by that
+# fallback, so this has to cover CHALLENGE_STORY_MAPS entirely.
+# East Town is keyed on "east" rather than "town" deliberately: "town" and
+# "tomb" score about equally against a garbled read of either, which pushes
+# both below the runner-up margin and makes King's Tomb undetectable as
+# collateral (test_challenge_map_ocr_uses_unique_map_words covers that read).
+# Pick the word that no other map shares, not just any word from the name.
+CHALLENGE_MAP_OCR_ALIASES = {
+    "School Grounds": "grounds",
+    "Rose Kingdom": "kingdom",
+    "Fairy King Forest": "fairy",
+    "King's Tomb": "tomb",
+    "Flower Forest": "flower",
+    "East Town": "east",
+}
+# Words the map label carries that never identify a map ("Grounds - Act 1").
+# Scored against an alias they are just noise that can out-rank the real
+# match, so they are dropped before comparison.
+CHALLENGE_MAP_OCR_STOPWORDS = frozenset({"act", "stage", "challenge", "daily"})
 # Mirrors main.py's CHALLENGE_STAGE_SLOTS.
 CHALLENGE_STAGE_SLOTS = ["1", "2", "3"]
 # Fixed click points for the 3 Regular Challenge stage rows -- no image
@@ -329,6 +445,20 @@ TELEPORT_IN_TIMEOUT = 30.0
 # fires a beat too early and the right-click-drag/scroll doesn't register
 # that time. This settle is the fix -- see _run_prestart.
 CAMERA_SETUP_SETTLE = 0.6
+# The same "nav_unitmanager is up but the world isn't ready" problem, on the
+# Repeat Stage path. A first entry gets CAMERA_SETUP_SETTLE plus the camera
+# drag itself (a 730ms hold and its O taps) plus Team Loadout before any
+# unit is placed -- seconds of incidental settling. A repeat skips all
+# three and goes straight from "Teleported in-game" to Place Unit, with
+# nothing between them.
+#
+# What that looks like when it goes wrong: every unit in the template
+# aligning to the SAME large offset, out at the edge of the 38px search box
+# (reported live: four units all at (18, 17), placing the whole team ~16px
+# off). A uniformly displaced view is exactly what a map still settling
+# into place reads as. Placement is the only Pre Start step that reads
+# pixels off the world, so it is the one that notices.
+REPEAT_ENTRY_SETTLE = 5.0
 # Clicking Enter Matchmaking doesn't teleport you in on its own -- it only
 # happens once the lobby actually FILLS with real players, which can take
 # anywhere from seconds to several minutes depending on server population,
@@ -354,6 +484,46 @@ RECONNECT_IMAGE_NAMES = ("reconnect",)
 # restricted to the right-side cards panel (x: 440..1152) to exclude the left 3D viewport
 # where player silhouettes and party [+] invite buttons render.
 GAMEMODE_CARD_REGION = (440, 0, 712, 756)
+# ...but only as the FIRST attempt. The box assumes a fixed card layout, and
+# the menu keeps gaining cards (Tower and Event in v0.19.0), so a mode can end
+# up rendering outside it -- reported as the run repeatedly clicking Play and
+# then "Expedition never showed up". A boxed miss now retries against the whole
+# window for this long before the task is failed (see _find_gamemode_card).
+# Shorter than the boxed attempt: by this point the menu is known to be open,
+# so the card is either visible or genuinely absent.
+GAMEMODE_CARD_WIDE_TIMEOUT = 5.0
+
+# Mid-match lobby re-sync: nav_play only renders on the lobby, so seeing it
+# from inside a match means we are not in one any more -- someone clicked
+# Return to Lobby by hand, or the game ejected us. Confirmed over this many
+# consecutive polls before acting, since aborting a live match is expensive
+# and one frame caught mid-transition is not worth acting on.
+LOBBY_RESYNC_CONFIRMATIONS = 2
+# The same "are we actually on the lobby" question during a teleport wait, but
+# that loop can run for five minutes on matchmaking and polls fast, so the
+# check runs every Nth poll rather than every one -- a full-window search per
+# tick would be real cost for a state that does not change that quickly.
+# Counted in polls rather than seconds deliberately: the wait's timing is
+# asserted tick-by-tick (see tests/test_runner_teleport.py), and reading the
+# clock again here would change that shape for a rate limit that does not need
+# wall time to be correct.
+LOBBY_CHECK_EVERY_N_POLLS = 6
+
+# AFK Chamber: an Expedition encounter node can drop the client in here, and
+# nothing about it reads as a disconnect or a lobby -- so the runner sat
+# polling a screen that can never show Victory/Defeat until MATCH_RESULT_
+# TIMEOUT, once per node, for the rest of the run.
+# The banner is a fixed HUD element at the top centre, so it gets a band
+# rather than a full-window scan: this check runs on EVERY result poll, and a
+# whole-window template sweep at that rate is not worth it for a title that
+# does not move. Optional, like nav_disband -- no afk_chamber.png just skips.
+AFK_CHAMBER_REGION = (451, 30, 258, 38)
+# The exit sits below the banner, at a fixed spot in the 1152x756 reference
+# space -- same kind of measured constant as STORY_CLICK.
+AFK_CHAMBER_EXIT_CLICK = (660, 716)
+# The banner lingers while the exit animates, so re-clicking every poll would
+# fight the transition the first click already started.
+AFK_CHAMBER_CLICK_COOLDOWN = 5.0
 
 NAV_PLAY_IMAGE_NAMES = ("nav_play",)
 EXPEDITION_IMAGE_NAMES = ("expedition",)
@@ -363,6 +533,13 @@ STORY_IMAGE_NAMES = ("story",)
 NAV_START_IMAGE_NAMES = ("nav_start",)
 NAV_DISBAND_IMAGE_NAMES = ("nav_disband",)
 PARTY_OVERLAY_IMAGE_NAMES = NAV_DISBAND_IMAGE_NAMES + ("invite_players_open",)
+# Modals that cover the LOBBY rather than the gamemode menu -- the Update Log
+# shown after a game update or a fresh login is the common one. Play renders
+# behind it and still matches, so the click is found and lands on the modal
+# instead: observed as three "nav_back not found -- still on the lobby,
+# re-clicking Play" retries in a row while the patch notes sat on screen.
+# Optional like nav_disband: no image means the check does nothing.
+LOBBY_OVERLAY_CLOSE_IMAGE_NAMES = ("update_log_close",)
 # 10 visual variants on file, all inside Assets/ui/priority_upgrade/ --
 # every one tried per search, same folder-variant mechanism as above.
 PRIORITY_UPGRADE_IMAGE_NAMES = ("priority_upgrade",)
@@ -493,6 +670,18 @@ AUTO_UPGRADE_CLEAR_HOLD = 1.0    # press-and-hold that clears it back to off
 
 AUTO_UPGRADE_CLICK_SETTLE = 0.6
 
+# Click input searches for priority_upgrade after AUTO_UPGRADE_CLICK_SETTLE.
+# That single check was reported missing panels that were merely slow: a unit
+# placed as a wave spawns can still be rendering its info panel at 0.6s, and
+# the block logged "not found -- skipping" against a panel that appeared a
+# moment later. Poll to a deadline instead, the same shape _run_upgrade_unit_
+# tick already uses for upgradeable/not_upgradeable (UPGRADE_PANEL_LOAD_
+# TIMEOUT above) -- a panel that is already up still costs one search, so the
+# common case is unchanged. Hotkey input deliberately never searches at all
+# and is untouched by this.
+AUTO_UPGRADE_PANEL_LOAD_TIMEOUT = 3.0
+AUTO_UPGRADE_PANEL_POLL_INTERVAL = 0.15
+
 # Team Loadout application (see _apply_team_loadout) -- H opens the panel,
 # then Loadout 1-3 are stacked rows at a fixed position. 4+ exist in
 # Creation's picker but aren't reachable yet without scrolling.
@@ -543,6 +732,63 @@ TEAM_LOADOUT_SCROLL_SETTLE = 0.5
 # Wait for Wave (see _run_wait_wave_tick) -- the "<current> / <max> wave"
 # HUD badge, in the docked game window's own client coordinates.
 WAVE_REGION = (467, 21, 104, 61)
+# Expedition puts the same badge somewhere else, and the box above does not
+# reach it: it starts 50px right of where Expedition renders the badge, so
+# "3 / 5 wave" is captured as just "5 wave". read_wave reports NO MAXIMUM for
+# slash-free text -- Infinite's HUD genuinely is "6 wave" -- so a finite run
+# comes back as "5 (unlimited)", the maximum read as the current. A Wait for
+# Wave block then unblocks on wave 1 while logging that it reached wave 5,
+# and every block behind it runs early. read_wave's own preference for
+# slash-bearing votes cannot rescue that: with the slash outside the crop,
+# every vote is current-only.
+#
+# It is also 61px tall against a 33px badge, reaching into the
+# "<n> / <max> units" chip underneath -- the same digits-and-slash shape,
+# feeding a second number to the same parse.
+#
+# Measured on a live Expedition frame with the Image Manager's region tool.
+# Only Expedition is changed; the shared box above is left exactly as it is,
+# since it is what Story/Raid/Infinite have been reading correctly.
+EXPEDITION_WAVE_REGION = (417, 16, 110, 33)
+# Not every Expedition gamemode HAS waves. The payload modes count enemies
+# around the objective instead, and their HUD shows "<n> enemies" where a
+# wave badge would be -- so a Wait for Wave block there waits on a number
+# that will never exist, and every block behind it (the placements it was
+# put in front of) never runs at all.
+#
+# A level-up "Select an upgrade!" card is proof the battle is genuinely
+# under way: they are handed out for kills, so one cannot appear before the
+# fighting starts. On Expedition, that is accepted as the release condition
+# when the badge cannot be read -- after a short settle, so the block does
+# not fire on the same tick the card is still being clicked through.
+# Story/Raid keep waiting for a real number; their badge always exists, and
+# an unreadable one there means a detection problem worth surfacing rather
+# than working around.
+# A QUIET PERIOD, not a countdown from the first card -- every fresh
+# disruption restarts it, deliberately. A card means the round is still
+# churning; a mid-run Start Game means it is re-staging and the units have
+# just run off the board. Placing into either is what this exists to avoid,
+# so the clock measures "nothing has happened for a while" rather than "some
+# time has passed since the battle began".
+#
+# Waiting costs nothing: the poll loop keeps playing the match -- taking
+# cards, clicking Continues, handling encounters -- the entire time.
+#
+# The trade-off, stated plainly: on a run where cards keep arriving closer
+# together than this, the wait never releases and the deferred placements
+# never happen. MATCH_RESULT_TIMEOUT is the only backstop.
+WAIT_WAVE_NO_COUNTER_SETTLE = 20.0
+# A mid-run "Start Game?" stages a new sub-round, and the units already
+# placed run off the board entirely -- their tiles free up, so the Battle
+# phase is replayed from the top to put them back.
+#
+# Once per MATCH, on that match's FIRST Start Game only -- and every repeat
+# of the stage is its own match, so each one gets its own replay. Later Start
+# Game popups within the same match are left alone deliberately: re-arming on
+# each would let a chatty popup rewind the phase indefinitely, so the
+# placements keep restarting and never finish. One replay covers the case
+# this exists for -- the re-stage that empties the board -- and anything past
+# that is the run misbehaving in a way more re-placing will not fix.
 # OCR here is several real Tesseract subprocess spawns (see core.wave/
 # core.ocr's multi-mask sweep) -- checked on this cadence, not every single
 # Battle-tick poll, so a long wait for a distant wave doesn't spend most of
@@ -575,12 +821,23 @@ DEFAULT_COORDS = {
     "stage_row_height": STAGE_ROW_HEIGHT,
     "act_row_x": ACT_CLICK_BASE[0], "act_row_y": ACT_CLICK_BASE[1],
     "act_row_height": ACT_ROW_HEIGHT,
+    # Event gamemode card click point (see runner._reach_event_act_selected):
+    # the card is clicked HERE by coordinate, then the event_gamemode button
+    # (the image with the "Event Gamemode" text) is found and clicked by
+    # image search. No tuple constant above -- keep it in sync with main.py's
+    # MACRO_COORD_DEFAULTS.
+    "event_gamemode_x": 152, "event_gamemode_y": 253,
     "challenge_stage_1_x": CHALLENGE_STAGE_CLICK["1"][0], "challenge_stage_1_y": CHALLENGE_STAGE_CLICK["1"][1],
     "challenge_stage_2_x": CHALLENGE_STAGE_CLICK["2"][0], "challenge_stage_2_y": CHALLENGE_STAGE_CLICK["2"][1],
     "challenge_stage_3_x": CHALLENGE_STAGE_CLICK["3"][0], "challenge_stage_3_y": CHALLENGE_STAGE_CLICK["3"][1],
     "expedition_difficulty_x": EXPEDITION_DIFFICULTY_CLICK[0], "expedition_difficulty_y": EXPEDITION_DIFFICULTY_CLICK[1],
     "team_loadout_x": TEAM_LOADOUT_CLICK_1[0], "team_loadout_y": TEAM_LOADOUT_CLICK_1[1],
     "team_loadout_row_height": TEAM_LOADOUT_ROW_HEIGHT,
+    # Optional manual point inside the Unit Manager's Teams button. None
+    # keeps the normal image-match center click; Settings > Debug can fill
+    # this from a live screenshot when a user's button needs a lower/safer
+    # click point than the matched crop's center.
+    "team_button_x": None, "team_button_y": None,
     "screen_middle_x": SCREEN_MIDDLE_CLICK[0], "screen_middle_y": SCREEN_MIDDLE_CLICK[1],
     "unit_info_reset_x": UNIT_INFO_RESET_CLICK[0], "unit_info_reset_y": UNIT_INFO_RESET_CLICK[1],
     "daily_challenge_tab_x": 250, "daily_challenge_tab_y": 315,
@@ -645,6 +902,8 @@ FUEL_UNIT_SECONDS = 5 * 60
 FUEL_MIN_SAFETY_SECONDS = 5 * 60
 FUEL_SAFETY_RATIO = 0.04
 FUEL_INTERVAL_SECONDS = 8 * 60 * 60
+FUEL_INTERVAL_MINUTES_MIN = 1
+FUEL_INTERVAL_MINUTES_MAX = 10080  # 7 days
 FUEL_RETRY_SECONDS = 5 * 60
 FUEL_AMOUNT_MAX = 100
 FUEL_AREA_TIMEOUT = 10.0
@@ -654,6 +913,13 @@ FUEL_CLICK_DELAY = 1.2
 FUEL_ACTION_TIMEOUT = 15.0
 FUEL_CONFIRM_TIMEOUT = 20.0
 FUEL_CLOSE_TIMEOUT = 2.0
+
+
+def fuel_interval_override_seconds(minutes) -> int:
+    """Return a user override interval in seconds, clamped to the allowed range."""
+    if minutes == 0:
+        return 0
+    return min(FUEL_INTERVAL_MINUTES_MAX, max(FUEL_INTERVAL_MINUTES_MIN, minutes)) * 60
 
 
 def fuel_refill_interval_seconds(amount) -> int:

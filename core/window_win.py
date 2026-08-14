@@ -44,6 +44,11 @@ advapi32.GetTokenInformation.argtypes = [
     wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+kernel32.TerminateProcess.restype = wintypes.BOOL
+kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 ROBLOX_PROCESS_NAME = "robloxplayerbeta.exe"
 ROBLOX_PROCESS_NAMES = {
     "robloxplayerbeta.exe",
@@ -419,6 +424,28 @@ def get_window_pid(hwnd: int) -> int:
     return pid.value
 
 
+def close_roblox_process(hwnd: int) -> None:
+    """Forcefully terminate the Roblox client owning ``hwnd``.
+
+    Used by the rejoin path: a client wedged on Roblox's Reconnect/Retry
+    prompt never answers the deep link, so the macro closes it outright
+    (same end state as a crash) and boots a fresh client instead. This is
+    TerminateProcess, deliberately -- WM_CLOSE is ignored by a stuck
+    client, and the whole point is that it MUST die. Roblox's launcher is
+    left alone: it's the process that answers the roblox:// deep link, so
+    it should stay to spawn the fresh client."""
+    pid = get_window_pid(hwnd)
+    if not pid:
+        return
+    h_process = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if not h_process:
+        return
+    try:
+        kernel32.TerminateProcess(h_process, 1)
+    finally:
+        kernel32.CloseHandle(h_process)
+
+
 def list_roblox_windows() -> list:
     """Every currently open, standalone Roblox window (same title+process
     check as find_roblox_window, but doesn't stop at the first match) --
@@ -465,6 +492,26 @@ def get_window_rect_screen(hwnd: int):
     return rect.left, rect.top, rect.right, rect.bottom
 
 
+def get_client_rect_screen(hwnd: int):
+    """Return hwnd's client area in screen coordinates.
+
+    Vision coordinates are measured from the top-left of Roblox's rendered
+    viewport, not from a standalone window's title bar or resize frame.  The
+    distinction disappears for the borderless docked child, but it matters
+    when Roblox is framed or temporarily undocked.
+    """
+    client = RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(client)):
+        return get_window_rect_screen(hwnd)
+
+    top_left = wintypes.POINT(client.left, client.top)
+    bottom_right = wintypes.POINT(client.right, client.bottom)
+    if (not user32.ClientToScreen(hwnd, ctypes.byref(top_left))
+            or not user32.ClientToScreen(hwnd, ctypes.byref(bottom_right))):
+        return get_window_rect_screen(hwnd)
+    return top_left.x, top_left.y, bottom_right.x, bottom_right.y
+
+
 def is_foreground(hwnd: int) -> bool:
     return user32.GetForegroundWindow() == hwnd
 
@@ -505,14 +552,14 @@ def capture_window_rgb(hwnd: int):
     """
     rect = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    w, h = rect.right - rect.left, rect.bottom - rect.top
-    if w <= 0 or h <= 0:
+    outer_w, outer_h = rect.right - rect.left, rect.bottom - rect.top
+    if outer_w <= 0 or outer_h <= 0:
         return None
     hdc = user32.GetWindowDC(hwnd)
     if not hdc:
         return None
     mem_dc = gdi32.CreateCompatibleDC(hdc)
-    bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, outer_w, outer_h)
     old = gdi32.SelectObject(mem_dc, bmp)
     try:
         # A fresh GDI bitmap is NOT guaranteed zeroed -- it can hold recycled
@@ -523,23 +570,38 @@ def capture_window_rgb(hwnd: int):
         # (this is exactly how "Use Roblox Screen" kept returning the macro's
         # own UI). Blacken the bitmap first so a no-op PrintWindow is always
         # detected as the failure it is.
-        gdi32.PatBlt(mem_dc, 0, 0, w, h, 0x00000042)  # BLACKNESS
+        gdi32.PatBlt(mem_dc, 0, 0, outer_w, outer_h, 0x00000042)  # BLACKNESS
         if not user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT):
             return None
         bmi = _BITMAPINFOHEADER()
         bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
-        bmi.biWidth = w
-        bmi.biHeight = -h  # negative = top-down row order
+        bmi.biWidth = outer_w
+        bmi.biHeight = -outer_h  # negative = top-down row order
         bmi.biPlanes = 1
         bmi.biBitCount = 32
         bmi.biCompression = 0  # BI_RGB
-        buf = (ctypes.c_char * (w * h * 4))()
-        if gdi32.GetDIBits(mem_dc, bmp, 0, h, buf, ctypes.byref(bmi), 0) != h:
+        buf = (ctypes.c_char * (outer_w * outer_h * 4))()
+        if gdi32.GetDIBits(mem_dc, bmp, 0, outer_h, buf, ctypes.byref(bmi), 0) != outer_h:
             return None
         import cv2
         import numpy as np
         # Zero-copy NumPy view over the C DIBits buffer (BGRA format)
-        arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+        arr = np.frombuffer(buf, dtype=np.uint8).reshape(outer_h, outer_w, 4)
+        # PrintWindow renders the non-client frame as well when the DC was
+        # obtained with GetWindowDC. Crop it back to the same client-space
+        # image that the screen-grab and WGC paths return, otherwise a
+        # fallback capture would find the button in one coordinate system
+        # and click it in another.
+        client_left, client_top, client_right, client_bottom = get_client_rect_screen(hwnd)
+        crop_x = client_left - rect.left
+        crop_y = client_top - rect.top
+        crop_w = client_right - client_left
+        crop_h = client_bottom - client_top
+        if (crop_w > 0 and crop_h > 0
+                and 0 <= crop_x < outer_w and 0 <= crop_y < outer_h
+                and crop_x + crop_w <= outer_w and crop_y + crop_h <= outer_h):
+            arr = arr[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+        h, w = arr.shape[:2]
         if not arr[:, :, :3].any():  # "success" but nothing was actually rendered
             return None
         # Vectorized BGRA to RGB conversion in C/OpenCV

@@ -31,7 +31,10 @@ with a [window_mac] prefix.
 """
 
 import atexit
+import os
+import signal
 import subprocess
+import time
 
 import objc
 import Quartz
@@ -141,6 +144,37 @@ def get_window_pid(window_id: int) -> int:
     return pid or 0
 
 
+def close_roblox_process(window_id: int) -> None:
+    """Terminate the Roblox client owning ``window_id``.
+
+    Same role as window_win.close_roblox_process: the rejoin path closes a
+    client wedged on the Reconnect/Retry prompt outright (crash-equivalent
+    end state) so the deep link boots a fresh one. Tries the graceful
+    AppKit terminate first; a wedged client can ignore that, so it then
+    SIGKILLs after a short grace period. The launcher app is left alone --
+    it answers the roblox:// deep link that spawns the fresh client."""
+    pid = get_window_pid(window_id)
+    if not pid:
+        return
+    try:
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if app is not None:
+            app.terminate()
+    except Exception as exc:
+        _log(f"graceful terminate raised: {exc}")
+    time.sleep(1.0)
+    try:
+        os.kill(pid, 0)  # still alive after the grace period?
+    except (ProcessLookupError, PermissionError):
+        return
+    except Exception:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception as exc:
+        _log(f"force-kill of Roblox (pid {pid}) failed: {exc}")
+
+
 def is_window(window_id: int) -> bool:
     # Full list, not just on-screen: a minimized window must still count
     # as existing (mirrors Win32 IsWindow vs IsWindowVisible).
@@ -167,6 +201,16 @@ def get_window_rect_screen(window_id: int):
     right = left + int(b.get("Width", 0))
     bottom = int(b.get("Y", 0)) + int(b.get("Height", 0))
     return left, top, right, bottom
+
+
+def get_client_rect_screen(window_id: int):
+    """Return the game content rectangle in screen points.
+
+    macOS's window rectangle helper already excludes the estimated title bar,
+    so this mirrors the Windows client-area API without changing the existing
+    macOS coordinate convention.
+    """
+    return get_window_rect_screen(window_id)
 
 
 def _ax_first_window(window_id: int):

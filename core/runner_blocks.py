@@ -7,6 +7,7 @@ Methods here run with MacroRunner's full self: shared state and helpers
 (_log, _coords, _checkpoint, _click_found_image, ...) resolve normally.
 """
 import math
+import sys
 import threading
 import time
 
@@ -215,6 +216,34 @@ class BlockOps:
                 done = self._run_auto_upgrade_unit_tick(hwnd, stop_event, block, self._battle_block_index + 1)
                 self._battle_block_state = {}
             elif btype == "place_unit":
+                # A level-up "Select an upgrade!" card renders over the board,
+                # so it swallows the placement click: the unit is never placed
+                # and the tile search may not even find a highlight. Battle
+                # blocks tick BEFORE the poll loop's own card dismissal, so
+                # without this the race is simply lost whenever a card lands
+                # on the same tick as a placement.
+                #
+                # Take the card now and place on the next poll rather than
+                # clearing it in a loop here -- the whole match loop shares
+                # this tick, and a card that keeps re-appearing must not hold
+                # it. The index is not advanced, so this same block runs again
+                # a poll later against a clear board.
+                if self._dismiss_reward_card_if_found(hwnd):
+                    self._log(f'[Macro] Battle block #{self._battle_block_index + 1} '
+                              f'(Place Unit): cleared an upgrade card first -- placing next poll.')
+                    return
+                # The "Start Game?" confirmation can come back mid-run, and it
+                # covers the board the same way. Only deferred, not clicked
+                # here: _check_expedition_wave_result already handles it later
+                # in this very poll (with the Z-deselect it needs), so waiting
+                # a tick is enough and there is no second click path to keep
+                # in step. Gated on Expedition because that handler is the
+                # thing that clears it -- deferring on a mode with nobody to
+                # clear it would stall the block instead of delaying it.
+                if self._is_expedition_match and self._find_start_game_button(hwnd)[1] is not None:
+                    self._log(f'[Macro] Battle block #{self._battle_block_index + 1} '
+                              f'(Place Unit): "Start Game" is up -- placing after it is dealt with.')
+                    return
                 # Mid-battle placement (a reinforcement dropped in later,
                 # not a Pre Start starter) -- same pixel-search-place/verify
                 # logic Pre Start uses, one-shot like Sell Unit. Continues
@@ -617,7 +646,7 @@ class BlockOps:
 
         try:
             from core import wave as wave_module
-            image = vision.capture_window_region_bgr(hwnd, WAVE_REGION)
+            image = vision.capture_window_region_bgr(hwnd, self._wave_region)
             if image is None or image.size == 0:
                 raise RuntimeError("Roblox window capture returned no pixels")
             current, maximum = wave_module.read_wave(image)
@@ -628,6 +657,24 @@ class BlockOps:
 
         if current is None:
             state.pop("wave_target_confirmation", None)
+            # Some Expedition gamemodes have no waves at all -- the payload
+            # ones count enemies around the objective, and their HUD shows
+            # "<n> enemies" where the badge would be. Waiting for a number
+            # that will never exist strands every block behind this one, which
+            # is exactly the placements it tends to be put in front of.
+            #
+            # A reward card is proof the battle is genuinely under way (they
+            # drop for kills), so it releases the block once the fighting has
+            # visibly started. Story/Raid keep waiting for a real number:
+            # their badge always exists, so an unreadable one there is a
+            # detection problem worth surfacing rather than working around.
+            quiet_for = time.time() - self._last_board_disruption_at
+            if (self._is_expedition_match and self._last_reward_card_at
+                    and quiet_for >= WAIT_WAVE_NO_COUNTER_SETTLE):
+                self._log(f"{label}: no wave counter on this gamemode, but the battle is "
+                          f"under way and the board has been quiet for {quiet_for:.0f}s -- "
+                          f"treating the wait as done.")
+                return True
             self._log(f"{label}: couldn't read the wave counter -- retrying in {WAIT_WAVE_POLL_INTERVAL:.0f}s.")
             state["next_check"] = time.time() + WAIT_WAVE_POLL_INTERVAL
             return False
@@ -738,13 +785,32 @@ class BlockOps:
             )
             return True
 
-        try:
-            priority_match, priority_name = vision.find_image_any(hwnd, PRIORITY_UPGRADE_IMAGE_NAMES)
-        except vision.TemplateNotFound as exc:
-            self._log(f'{label}: {exc}')
-            return True
+        # Wait for the info panel to actually finish rendering rather than
+        # checking once, AUTO_UPGRADE_CLICK_SETTLE after the click. That single
+        # check was reported failing on units placed while a wave spawns -- the
+        # panel was simply slower than 0.6s that frame, and the block gave up on
+        # it with "not found -- skipping" even though it appeared right after.
+        # This is the same poll-to-a-deadline _run_upgrade_unit_tick already
+        # does for upgradeable/not_upgradeable; a panel that is already up
+        # still costs exactly one search, so nothing gets slower in the normal
+        # case. Hotkey input never reaches here -- it deliberately does not
+        # depend on finding this button at all.
+        deadline = time.time() + AUTO_UPGRADE_PANEL_LOAD_TIMEOUT
+        priority_match, priority_name = None, None
+        while True:
+            try:
+                priority_match, priority_name = vision.find_image_any(hwnd, PRIORITY_UPGRADE_IMAGE_NAMES)
+            except vision.TemplateNotFound as exc:
+                self._log(f'{label}: {exc}')
+                return True
+            if priority_match is not None or time.time() >= deadline:
+                break
+            if self._checkpoint(stop_event):
+                return True
+            time.sleep(AUTO_UPGRADE_PANEL_POLL_INTERVAL)
         if priority_match is None:
-            self._log(f'{label}: "priority_upgrade" not found on the info panel -- skipping.')
+            self._log(f'{label}: "priority_upgrade" not found on the info panel '
+                       f'(within {AUTO_UPGRADE_PANEL_LOAD_TIMEOUT:.0f}s) -- skipping.')
             return True
 
         debug_path = self._debug_save(hwnd, priority_name, priority_match)
@@ -1050,15 +1116,31 @@ class BlockOps:
             self._keyboard.key_up(keys.VK_SHIFT)
             self._quick_place_shift_down = False
 
+    def _capture_place_search_region(self, hwnd, left: int, top: int, region: tuple):
+        """Capture the frame that contains Roblox's placement highlight.
+
+        On macOS the highlight is part of the composed Metal frame and can be
+        missing from CGWindowListCreateImage even though the rest of the
+        window is captured correctly. The screen capture is intentional for
+        this small, visible-only scan; Windows keeps the window-content path
+        to avoid the display-flash regression that motivated the v0.18 change.
+        """
+        if sys.platform == "darwin":
+            from core.ocr import capture_region
+            x, y, width, height = (int(value) for value in region)
+            return capture_region(left + x, top + y, width, height)
+        return vision.capture_window_region_bgr(hwnd, region)
+
     def _scan_place_search_box(self, hwnd, left: int, top: int, orig_x: int, orig_y: int):
         """One capture of the PLACE_SEARCH_BOX_SIZE x PLACE_SEARCH_BOX_SIZE
         region around (orig_x, orig_y) -- window-client coords -- scanned in
         memory for a pixel at/near 0xffffff (white, within
         PLACE_VALID_PIXEL_TOLERANCE per channel). Returns the (dx, dy) offset
         of whichever valid pixel is CLOSEST to (orig_x, orig_y), or None if
-        nothing valid was found anywhere in the box. The capture is taken from
-        Roblox's own window contents, not a screen-space grab, so repeated
-        placement scans cannot flash recording overlays on the display.
+        nothing valid was found anywhere in the box. Windows reads Roblox's
+        window contents to avoid display flashes; macOS uses a small screen
+        capture because its transient placement highlight can be missing from
+        CGWindowListCreateImage.
 
         The box is CLAMPED to the game window. Centering it blindly meant a
         spot within half a box of an edge captured pixels from outside the
@@ -1080,7 +1162,7 @@ class BlockOps:
         # narrower than the box degrades to "start at 0" rather than negative.
         box_x = max(0, min(orig_x - half, FIXED_WIN_W - size))
         box_y = max(0, min(orig_y - half, FIXED_WIN_H - size))
-        patch = vision.capture_window_region_bgr(hwnd, (box_x, box_y, size, size))
+        patch = self._capture_place_search_region(hwnd, left, top, (box_x, box_y, size, size))
         if patch is None or patch.size == 0:
             return None
         b, g, r = patch[:, :, 0].astype(int), patch[:, :, 1].astype(int), patch[:, :, 2].astype(int)

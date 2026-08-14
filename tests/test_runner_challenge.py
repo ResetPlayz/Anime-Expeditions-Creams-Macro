@@ -3,6 +3,7 @@ import threading
 import numpy as np
 import pytest
 
+from core import ocr
 from core import vision
 from core import ocr_windows
 from core.runner_challenge import ChallengeOps
@@ -120,6 +121,41 @@ def test_daily_challenge_unavailable_marks_current_game_day_complete():
     assert marked == ["daily"]
 
 
+def test_regular_challenge_finishes_slots_1_2_3_in_one_ordered_pass():
+    probe = ChallengeProbe()
+    played = []
+    marked = []
+    reads = 0
+
+    def settings():
+        nonlocal reads
+        reads += 1
+        # Simulate live state changing after slot 1. The pass must retain
+        # the work it accepted at entry instead of returning to the task.
+        ready = reads == 1
+        return {
+            "enabled": True,
+            "play_mode": "solo",
+            "daily": {"enabled": False, "ready": False},
+            "cap": 0,
+            "stages": {
+                slot: {"enabled": True, "ready": ready, "count": 0}
+                for slot in ("1", "2", "3")
+            },
+        }
+
+    probe._get_challenge_settings = settings
+    probe._checkpoint = lambda _stop: False
+    probe._run_one_challenge_stage = (
+        lambda _hwnd, _stop, slot, *_args: played.append(slot) or "win")
+    probe._mark_challenge_stage_played = lambda slot: marked.append(slot)
+
+    ChallengeOps._run_challenges(probe, 123, threading.Event(), {}, {}, {})
+
+    assert played == ["1", "2", "3"]
+    assert marked == ["1", "2", "3"]
+
+
 @pytest.mark.parametrize(
     ("ocr_text", "expected"),
     (
@@ -128,6 +164,7 @@ def test_daily_challenge_unavailable_marks_current_game_day_complete():
         ("Fary King Forest", "Fairy King Forest"),
         ("Tornb - Act 1", "King's Tomb"),
         ("Flovver Forest", "Flower Forest"),
+        ("Eest Town - Act 1", "East Town"),
     ),
 )
 def test_challenge_map_ocr_uses_unique_map_words(monkeypatch, ocr_text, expected):
@@ -139,7 +176,8 @@ def test_challenge_map_ocr_uses_unique_map_words(monkeypatch, ocr_text, expected
         "find_in_gray_multiscale",
         lambda *_args, **_kwargs: {"x": 895, "y": 348, "w": 123, "h": 21},
     )
-    monkeypatch.setattr(ocr_windows, "ocr_image", lambda _image: ocr_text)
+    monkeypatch.setattr(ocr, "get_pytesseract", lambda: (_ for _ in ()).throw(ocr.TesseractNotAvailable()))
+    monkeypatch.setattr(ocr, "ocr_mask", lambda _engine, _image, _config: ocr_text)
 
     assert ChallengeOps._detect_challenge_map_ocr(probe, 123) == expected
 
@@ -153,6 +191,47 @@ def test_challenge_map_ocr_does_not_guess_from_shared_forest_word(monkeypatch):
         "find_in_gray_multiscale",
         lambda *_args, **_kwargs: {"x": 895, "y": 348, "w": 123, "h": 21},
     )
-    monkeypatch.setattr(ocr_windows, "ocr_image", lambda _image: "Forest - Act 1")
+    monkeypatch.setattr(ocr, "get_pytesseract", lambda: (_ for _ in ()).throw(ocr.TesseractNotAvailable()))
+    monkeypatch.setattr(ocr, "ocr_mask", lambda _engine, _image, _config: "Forest - Act 1")
 
     assert ChallengeOps._detect_challenge_map_ocr(probe, 123) is None
+
+
+def test_challenge_map_ocr_uses_hud_crop_before_fixed_fallback(monkeypatch):
+    probe = ChallengeProbe()
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    seen_shapes = []
+    monkeypatch.setattr(vision, "capture_game_bgr", lambda _hwnd: frame)
+    monkeypatch.setattr(
+        vision,
+        "find_in_gray_multiscale",
+        lambda *_args, **_kwargs: {"x": 100, "y": 20, "w": 20, "h": 10},
+    )
+    monkeypatch.setattr(ocr, "get_pytesseract", lambda: (_ for _ in ()).throw(ocr.TesseractNotAvailable()))
+
+    def fake_ocr(_engine, image, _config):
+        seen_shapes.append(image.shape[:2])
+        return "School Grounds"
+
+    monkeypatch.setattr(ocr, "ocr_mask", fake_ocr)
+
+    assert ChallengeOps._detect_challenge_map_ocr(probe, 123) == "School Grounds"
+    assert seen_shapes[0] == (43 * 8, 85 * 8)
+
+
+def test_challenge_map_ocr_uses_fixed_fallback_when_hud_absent(monkeypatch):
+    probe = ChallengeProbe()
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    seen_shapes = []
+    monkeypatch.setattr(vision, "capture_game_bgr", lambda _hwnd: frame)
+    monkeypatch.setattr(vision, "find_in_gray_multiscale", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ocr, "get_pytesseract", lambda: (_ for _ in ()).throw(ocr.TesseractNotAvailable()))
+
+    def fake_ocr(_engine, image, _config):
+        seen_shapes.append(image.shape[:2])
+        return "Rose Kingdom"
+
+    monkeypatch.setattr(ocr, "ocr_mask", fake_ocr)
+
+    assert ChallengeOps._detect_challenge_map_ocr(probe, 123) == "Rose Kingdom"
+    assert seen_shapes[0] == (10 * 8, 81 * 8)

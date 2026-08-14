@@ -30,6 +30,11 @@ from core.runner import MacroRunner
 from core import updater
 from core import auto_shop
 from core.auto_shop import current_auto_shop_period
+from core.runner_constants import (
+    BOUNTY_MYTHIC_DEFAULT_REROLLS,
+    BOUNTY_MYTHIC_MIN_REROLLS,
+    BOUNTY_MYTHIC_MAX_REROLLS,
+)
 
 # Imported at module scope (not inside the darwin branches that use it) so the
 # macOS-only geometry helpers below can be plain module functions. window_mac
@@ -179,11 +184,21 @@ MACRO_COORD_DEFAULTS = {
     "story_click_x": 666, "story_click_y": 147,
     "stage_row_x": 246, "stage_row_y": 230, "stage_row_height": 56,
     "act_row_x": 250, "act_row_y": 267, "act_row_height": 129,
+    # Event gamemode card click point (see runner._reach_event_act_selected):
+    # the card is clicked HERE by coordinate first, then the event_gamemode
+    # button (the image with the "Event Gamemode" text) is found and clicked
+    # by image search.
+    "event_gamemode_x": 152, "event_gamemode_y": 253,
     "challenge_stage_1_x": 460, "challenge_stage_1_y": 277,
     "challenge_stage_2_x": 460, "challenge_stage_2_y": 400,
     "challenge_stage_3_x": 460, "challenge_stage_3_y": 533,
     "expedition_difficulty_x": 441, "expedition_difficulty_y": 524,
     "team_loadout_x": 800, "team_loadout_y": 324, "team_loadout_row_height": 126,
+    # Optional override for the first Teams click. None means use the live
+    # image match center; the Macro Coordinates picker can save a safer point
+    # inside the button for layouts where its lower/inner area registers more
+    # reliably.
+    "team_button_x": None, "team_button_y": None,
     "screen_middle_x": 576, "screen_middle_y": 378,
     "unit_info_reset_x": 3, "unit_info_reset_y": 3,
 }
@@ -198,14 +213,17 @@ RUN_HISTORY_LIMIT = 50  # oldest entries drop off past this -- a running log, no
 
 # Challenge tab (Settings-adjacent, but its own screen -- see get_challenge_
 # settings): Regular Challenge has 3 fixed stage slots that each rotate
-# through one of the 5 Story maps over time, so config/count-tracking is
+# through the Story maps over time, so config/count-tracking is
 # keyed by MAP (which macro to run for it, how many times it's been played
 # today) while the 3 slots are just simple on/off toggles for "attempt
 # whatever's in this slot". CHALLENGE_STORY_MAPS matches TASK_DATA.story's
-# maps in ui/app.js. Daily counts and the once-a-day Daily Challenge use the
-# game's shared 00:00 UTC rollover; the independent Regular Challenge
-# stage-availability clock still rotates every :00/:30.
-CHALLENGE_STORY_MAPS = ["School Grounds", "Rose Kingdom", "Fairy King Forest", "King's Tomb", "Flower Forest"]
+# maps in ui/app.js -- a map the game can land on but this list omits gets no
+# Story Map Setup row, so setup_ready reports green while that destination has
+# no macro at all (test_challenge_maps.py guards the three copies). Daily
+# counts and the once-a-day Daily Challenge use the game's shared 00:00 UTC
+# rollover; the independent Regular Challenge stage-availability clock still
+# rotates every :00/:30.
+CHALLENGE_STORY_MAPS = ["School Grounds", "Rose Kingdom", "Fairy King Forest", "King's Tomb", "Flower Forest", "East Town"]
 CHALLENGE_STAGE_SLOTS = ["1", "2", "3"]
 CHALLENGE_DAILY_CAP = 10  # fixed, not user-editable -- see get_challenge_settings
 CHALLENGE_RESET_SCHEDULE = "utc_midnight_v1"
@@ -366,6 +384,48 @@ def _mac_panel_layout() -> dict:
         "expanded_w": width,
         "game_x": x + panel_w + MAC_GAP, "game_y": y,
     }
+
+
+def _capture_game_region(hwnd: int, region: dict):
+    """Read the game's pixels for a settings-calibrated region.
+
+    Region dicts from Settings > Debug are stored in game-client coordinates
+    (see get_reward_region / get_stats_region): offsets from the game
+    window's own top-left. On Windows the game is a child window inside this
+    one, so the screen-space rect is the game's screen origin plus the
+    region. On macOS the game is a separate top-level window that the panel
+    can cover when it is expanded (see set_panel_expanded), so a screen grab
+    would read the panel -- there we read the window's own backing store
+    through vision's window-content path, which uses the same client-space
+    convention. Raises if the window capture comes back empty so callers'
+    existing error handling treats it as a failed capture.
+    """
+    if sys.platform == "darwin":
+        from core.ocr import capture_region_from_window
+        image = capture_region_from_window(
+            hwnd, region["x"], region["y"], region["width"], region["height"])
+        if image is None:
+            raise RuntimeError("window capture returned no image")
+        return image
+    from core.ocr import capture_region
+    game_left, game_top, _, _ = wm.get_window_rect_screen(hwnd)
+    return capture_region(
+        game_left + int(region["x"]), game_top + int(region["y"]),
+        int(region["width"]), int(region["height"]))
+
+
+def _game_region_color_matches(hwnd: int, x: int, y: int, width: int, height: int,
+                               expected_rgb_hex: int, tolerance: int = 20) -> bool:
+    """Color-probe twin of _capture_game_region, for a client-space rect."""
+    if sys.platform == "darwin":
+        from core.ocr import sample_color_matches_window
+        return sample_color_matches_window(
+            hwnd, x, y, width, height, expected_rgb_hex, tolerance)
+    from core.ocr import sample_color_matches
+    game_left, game_top, _, _ = wm.get_window_rect_screen(hwnd)
+    return sample_color_matches(
+        game_left + int(x), game_top + int(y), int(width), int(height),
+        expected_rgb_hex, tolerance)
 
 
 class Api:
@@ -833,6 +893,13 @@ class Api:
             cfg.update(clean)
         return {"ok": True, "saved": list(clean)}
 
+    def clear_macro_coord(self, prefix: str) -> dict:
+        """Clear an optional coordinate override back to automatic behavior."""
+        if prefix != "team_button":
+            return {"ok": False, "reason": "not_optional"}
+        cfg.update({"team_button_x": None, "team_button_y": None})
+        return {"ok": True, "cleared": ["team_button_x", "team_button_y"]}
+
     def reset_macro_coords(self) -> dict:
         cfg.update(dict(MACRO_COORD_DEFAULTS))
         return {"ok": True, "coords": dict(MACRO_COORD_DEFAULTS)}
@@ -1151,6 +1218,8 @@ class Api:
             "enabled": False,
             "play_mode": "solo",
             "summon_banner": "standard",
+            "mythic_only": False,
+            "mythic_max_rerolls": BOUNTY_MYTHIC_DEFAULT_REROLLS,
             "remaining": BOUNTY_DAILY_TOTAL,
             "total": BOUNTY_DAILY_TOTAL,
             "last_reset_date": _current_challenge_reset_period(),
@@ -1203,6 +1272,9 @@ class Api:
             "enabled": bool(settings.get("enabled")),
             "play_mode": settings.get("play_mode") or "solo",
             "summon_banner": settings.get("summon_banner") or "standard",
+            "mythic_only": bool(settings.get("mythic_only")),
+            "mythic_max_rerolls": int(settings.get(
+                "mythic_max_rerolls", BOUNTY_MYTHIC_DEFAULT_REROLLS)),
             "maps": settings.get("maps") or {},
         }})
 
@@ -1213,6 +1285,18 @@ class Api:
             merged["play_mode"] = "solo"
         if merged.get("summon_banner") not in ("standard", "villain"):
             merged["summon_banner"] = "standard"
+        merged["mythic_only"] = bool(merged.get("mythic_only"))
+        try:
+            merged["mythic_max_rerolls"] = max(
+                BOUNTY_MYTHIC_MIN_REROLLS,
+                min(
+                    BOUNTY_MYTHIC_MAX_REROLLS,
+                    int(merged.get(
+                        "mythic_max_rerolls", BOUNTY_MYTHIC_DEFAULT_REROLLS)),
+                ),
+            )
+        except (TypeError, ValueError):
+            merged["mythic_max_rerolls"] = BOUNTY_MYTHIC_DEFAULT_REROLLS
         try:
             total = max(1, min(99, int(merged.get("total") or BOUNTY_DAILY_TOTAL)))
         except (TypeError, ValueError):
@@ -1282,6 +1366,24 @@ class Api:
             return {"ok": False, "reason": "bad_banner"}
         settings = self.get_bounty_settings()
         settings["summon_banner"] = banner
+        self._save_bounty_settings(settings)
+        return {"ok": True}
+
+    def set_bounty_mythic_only(self, enabled: bool) -> dict:
+        settings = self.get_bounty_settings()
+        settings["mythic_only"] = bool(enabled)
+        self._save_bounty_settings(settings)
+        return {"ok": True}
+
+    def set_bounty_mythic_max_rerolls(self, value) -> dict:
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad_mythic_max_rerolls"}
+        if not (BOUNTY_MYTHIC_MIN_REROLLS <= limit <= BOUNTY_MYTHIC_MAX_REROLLS):
+            return {"ok": False, "reason": "bad_mythic_max_rerolls"}
+        settings = self.get_bounty_settings()
+        settings["mythic_max_rerolls"] = limit
         self._save_bounty_settings(settings)
         return {"ok": True}
 
@@ -1692,6 +1794,7 @@ class Api:
     def _default_fuel_settings() -> dict:
         return {
             "enabled": False,
+            "interval_minutes": 0,
             "resources": {
                 "resource_drill": {
                     "enabled": False,
@@ -1719,6 +1822,7 @@ class Api:
 
         canonical = {
             "enabled": bool(fuel.get("enabled")),
+            "interval_minutes": int(fuel.get("interval_minutes") or 0),
             "resources": {},
             "paths": {},
         }
@@ -1738,20 +1842,32 @@ class Api:
     def get_fuel_settings(self) -> dict:
         from core.runner_constants import (
             FUEL_AMOUNT_MAX,
+            FUEL_INTERVAL_MINUTES_MAX,
             FUEL_INTERVAL_SECONDS,
             FUEL_PATH_KEYS,
             FUEL_RESOURCES,
             FUEL_RETRY_SECONDS,
+            fuel_interval_override_seconds,
             fuel_refill_interval_seconds,
         )
 
         defaults = self._default_fuel_settings()
         saved = cfg.load().get("fuel_refill") or {}
+        try:
+            interval_minutes = int(saved.get("interval_minutes", defaults["interval_minutes"]))
+        except (TypeError, ValueError):
+            interval_minutes = 0
+        interval_minutes = min(FUEL_INTERVAL_MINUTES_MAX, max(0, interval_minutes))
+        default_interval_seconds = (
+            fuel_interval_override_seconds(interval_minutes)
+            if interval_minutes else FUEL_INTERVAL_SECONDS
+        )
         fuel = {
             "enabled": bool(saved.get("enabled", defaults["enabled"])),
             "resources": {},
             "paths": {},
-            "interval_seconds": FUEL_INTERVAL_SECONDS,
+            "interval_minutes": interval_minutes,
+            "interval_seconds": default_interval_seconds,
             "retry_seconds": FUEL_RETRY_SECONDS,
         }
         saved_resources = saved.get("resources") if isinstance(saved.get("resources"), dict) else {}
@@ -1770,6 +1886,10 @@ class Api:
                     amount = min(FUEL_AMOUNT_MAX, max(1, int(amount)))
                 except (TypeError, ValueError):
                     amount = "max"
+            effective_interval_seconds = (
+                fuel_interval_override_seconds(interval_minutes)
+                if interval_minutes else fuel_refill_interval_seconds(amount)
+            )
             try:
                 last_refilled_at = max(0.0, float(source.get("last_refilled_at") or 0))
             except (TypeError, ValueError):
@@ -1779,7 +1899,7 @@ class Api:
             except (TypeError, ValueError):
                 next_attempt_at = 0.0
             # Legacy development builds used retry_after only for failures.
-            # Derive the quantity-aware attempt once when that older shape is read.
+            # Derive the attempt once using the amount interval or user override.
             if "next_attempt_at" not in saved_source:
                 try:
                     retry_after = max(0.0, float(source.get("retry_after") or 0))
@@ -1787,7 +1907,7 @@ class Api:
                     retry_after = 0.0
                 next_attempt_at = max(
                     (
-                        last_refilled_at + fuel_refill_interval_seconds(amount)
+                        last_refilled_at + effective_interval_seconds
                         if last_refilled_at else 0.0
                     ),
                     retry_after,
@@ -1801,7 +1921,7 @@ class Api:
                 "next_attempt_at": next_attempt_at,
                 "next_due_at": next_attempt_at,
                 "remaining_seconds": max(0, int(next_attempt_at - now + 0.999)),
-                "interval_seconds": fuel_refill_interval_seconds(amount),
+                "interval_seconds": effective_interval_seconds,
                 "due": due,
             }
 
@@ -1826,6 +1946,40 @@ class Api:
         fuel["resources"][resource]["enabled"] = bool(enabled)
         self._save_fuel_settings(fuel)
         return {"ok": True}
+
+    def set_fuel_interval(self, minutes) -> dict:
+        from core.runner_constants import (
+            FUEL_INTERVAL_MINUTES_MAX,
+            FUEL_INTERVAL_MINUTES_MIN,
+            fuel_interval_override_seconds,
+            fuel_refill_interval_seconds,
+        )
+
+        try:
+            interval_minutes = int(minutes)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad_interval"}
+        if interval_minutes != 0:
+            interval_minutes = min(
+                FUEL_INTERVAL_MINUTES_MAX,
+                max(FUEL_INTERVAL_MINUTES_MIN, interval_minutes),
+            )
+        fuel = self.get_fuel_settings()
+        fuel["interval_minutes"] = interval_minutes
+        for resource in fuel["resources"].values():
+            if not resource.get("enabled"):
+                continue
+            last_refilled_at = float(resource.get("last_refilled_at") or 0)
+            if not last_refilled_at:
+                resource["next_attempt_at"] = 0.0
+                continue
+            interval_seconds = (
+                fuel_interval_override_seconds(interval_minutes)
+                if interval_minutes else fuel_refill_interval_seconds(resource.get("amount"))
+            )
+            resource["next_attempt_at"] = last_refilled_at + interval_seconds
+        self._save_fuel_settings(fuel)
+        return {"ok": True, "interval_minutes": interval_minutes}
 
     def set_fuel_resource_amount(self, resource: str, amount) -> dict:
         from core.runner_constants import FUEL_AMOUNT_MAX, FUEL_RESOURCES
@@ -1868,6 +2022,7 @@ class Api:
         from core.runner_constants import (
             FUEL_RESOURCES,
             FUEL_RETRY_SECONDS,
+            fuel_interval_override_seconds,
             fuel_refill_interval_seconds,
         )
 
@@ -1878,8 +2033,11 @@ class Api:
         now = time.time()
         if succeeded:
             state["last_refilled_at"] = now
-            state["next_attempt_at"] = (
-                now + fuel_refill_interval_seconds(state.get("amount")))
+            interval_seconds = (
+                fuel_interval_override_seconds(fuel.get("interval_minutes"))
+                if fuel.get("interval_minutes") else fuel_refill_interval_seconds(state.get("amount"))
+            )
+            state["next_attempt_at"] = now + interval_seconds
         else:
             state["next_attempt_at"] = now + FUEL_RETRY_SECONDS
         self._save_fuel_settings(fuel)
@@ -2243,9 +2401,12 @@ class Api:
         transfer_dir = self._transfer_directory(filename_prefix)
         os.makedirs(transfer_dir, exist_ok=True)
         dialog_type = getattr(getattr(webview, "FileDialog", None), "SAVE", getattr(webview, "SAVE_DIALOG", 2))
-        result = self._window.create_file_dialog(
-            dialog_type, directory=transfer_dir, save_filename=fname,
-            file_types=("JSON files (*.json)",))
+        try:
+            result = self._window.create_file_dialog(
+                dialog_type, directory=transfer_dir, save_filename=fname,
+                file_types=("JSON files (*.json)",))
+        except Exception as exc:
+            return {"ok": False, "reason": f"dialog_error: {exc}"}
         if not result:
             return {"ok": False, "reason": "cancelled"}
         path = result[0] if isinstance(result, (list, tuple)) else result
@@ -2264,8 +2425,15 @@ class Api:
         transfer_dir = self._transfer_directory(folder_kind)
         os.makedirs(transfer_dir, exist_ok=True)
         dialog_type = getattr(getattr(webview, "FileDialog", None), "OPEN", getattr(webview, "OPEN_DIALOG", 1))
-        result = self._window.create_file_dialog(
-            dialog_type, directory=transfer_dir, file_types=("JSON files (*.json)",))
+        try:
+            result = self._window.create_file_dialog(
+                dialog_type, directory=transfer_dir, file_types=("JSON files (*.json)",))
+        except Exception as exc:
+            # The native dialog can fail (window hidden/minimized, WebView2
+            # hiccup, etc.) -- surface it as a normal result so the JS side
+            # always has something to show instead of a silently-rejected
+            # promise that reads as "nothing happened".
+            return {"ok": False, "reason": f"dialog_error: {exc}"}
         if not result:
             return {"ok": False, "reason": "cancelled"}
         path = result[0] if isinstance(result, (list, tuple)) else result
@@ -2465,14 +2633,17 @@ class Api:
             "enabled": data.get("webhook_enabled", False),
             "silent": data.get("webhook_silent", False),
             "mention_id": data.get("webhook_mention_id", ""),
+            "progress": data.get("webhook_progress_enabled", False),
         }
 
-    def save_webhook_settings(self, url: str, enabled: bool, silent: bool, mention_id: str = "") -> dict:
+    def save_webhook_settings(self, url: str, enabled: bool, silent: bool, mention_id: str = "",
+                              progress: bool = False) -> dict:
         cfg.update({
             "webhook_url": url or "",
             "webhook_enabled": bool(enabled),
             "webhook_silent": bool(silent),
             "webhook_mention_id": (mention_id or "").strip(),
+            "webhook_progress_enabled": bool(progress),
         })
         return {"ok": True}
 
@@ -2714,16 +2885,14 @@ class Api:
         -- set by the dock arranger or skip_waiting); before that the window is
         still the small waiting-screen box and must stay that way.
 
-        Never expands WHILE THE MACRO IS RUNNING. Expanding covers Roblox, and
-        not everything that reads the game can see through that: core/vision.py
-        is immune (it reads the window's own backing store on mac -- see
-        _use_window_capture there), but core/ocr.py's capture_region is a plain
-        screen grab of a screen-space rect, so wave/reward/stats OCR would read
-        the panel's own pixels instead of the game. Staying collapsed mid-run
-        costs a cramped Settings screen; expanding costs silently wrong OCR."""
+        Expansion is safe even WHILE THE MACRO IS RUNNING: core/vision.py was
+        already immune (it reads the window's own backing store on mac -- see
+        _use_window_capture there), and the OCR crops that used to be plain
+        screen grabs (reward/stats reads, the scrollbar color probe) now go
+        through core.ocr.capture_region_from_window on mac too, so the panel's
+        own pixels are never mistaken for the game. The runner activates/
+        raises Roblox before it clicks anyway."""
         if sys.platform != "darwin" or not self._window or not self._mac_panel_ready:
-            return
-        if expanded and self.runner.is_running():
             return
         if not expanded and not self.docker.docked:
             # Nothing arranged beside us to make room for (Roblox not open, or
@@ -3675,22 +3844,15 @@ class Api:
                                        f"keeping its folder structure, or re-add crops via the Image Manager.")
 
         # OCR (wave/stats reading): Windows' built-in engine is preferred and
-        # needs nothing installed; Tesseract is only the fallback. The check
-        # passes if EITHER is available.
-        from core import ocr_windows
-        if ocr_windows.is_available():
-            add("Text reading (OCR)", True, "using Windows' built-in OCR -- no install needed")
-        else:
-            try:
-                from core import ocr
-                ocr.get_pytesseract()
-                tess_ok = True
-            except Exception:
-                tess_ok = False
-            add("Text reading (OCR)", tess_ok,
-                "" if tess_ok else "Windows OCR unavailable and Tesseract not found -- only stats/reward "
-                                   "reading and Wait-for-Wave need it. Install Tesseract via Settings > "
-                                   "General, or brew on macOS.")
+        # needs nothing installed; Tesseract is only the fallback. This is a
+        # real recognition smoke test, not just an import/package check.
+        from core import ocr
+        ocr_ok, ocr_detail = ocr.smoke_test_text_reader()
+        add("Text reading (OCR)", ocr_ok,
+            ocr_detail if ocr_ok else
+            f"{ocr_detail} -- only Auto Bounty, stats/reward reading, and Wait-for-Wave need it. "
+            "Install the Windows OCR dependencies from requirements.txt, or install Tesseract via "
+            "Settings > General.")
 
         overall = all(c["ok"] for c in checks)
         self.push_log(f"[Health] {'All checks passed.' if overall else 'Some checks need attention -- see above.'}")
@@ -3726,9 +3888,13 @@ class Api:
         if not self._window:
             return {"ok": False, "reason": "no_window"}
         fname = f"AnimeExpeditions-report-{time.strftime('%Y%m%d-%H%M%S')}.zip"
-        result = self._window.create_file_dialog(
-            webview.SAVE_DIALOG, directory=os.path.expanduser("~"), save_filename=fname,
-            file_types=("Zip files (*.zip)",))
+        dialog_type = getattr(getattr(webview, "FileDialog", None), "SAVE", getattr(webview, "SAVE_DIALOG", 2))
+        try:
+            result = self._window.create_file_dialog(
+                dialog_type, directory=os.path.expanduser("~"), save_filename=fname,
+                file_types=("Zip files (*.zip)",))
+        except Exception as exc:
+            return {"ok": False, "reason": f"dialog_error: {exc}"}
         if not result:
             return {"ok": False, "reason": "cancelled"}
         path = result[0] if isinstance(result, (list, tuple)) else result
@@ -3881,14 +4047,30 @@ class Api:
                 time.sleep(0.4)  # let it present a frame before photographing its rect
             wm.bring_to_top(hwnd)  # z-order only: no focus, no activation, no input
             try:
-                left, top, right, bottom = wm.get_window_rect_screen(hwnd)
-                width, height = right - left, bottom - top
-                if width <= 0 or height <= 0:
-                    return {"ok": False, "reason": "bad_region"}
-                import mss
-                with mss.MSS() as sct:
-                    shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
-                    bgra = shot.bgra
+                if sys.platform == "darwin":
+                    # A rectangular MSS grab photographs the desktop surface.
+                    # Roblox is rendered on a separate macOS compositor surface,
+                    # so that grab can contain only the wallpaper behind the game.
+                    # Quartz's per-window capture reads Roblox's own surface and is
+                    # already the capture path used by the live vision system.
+                    captured = wm.capture_window_rgb(hwnd)
+                    if not captured:
+                        return {"ok": False, "reason": "capture_failed"}
+                    rgb, width, height = captured
+                    import numpy as np
+                    image = np.frombuffer(rgb, np.uint8).reshape(height, width, 3)[:, :, ::-1]
+                else:
+                    left, top, right, bottom = wm.get_window_rect_screen(hwnd)
+                    width, height = right - left, bottom - top
+                    if width <= 0 or height <= 0:
+                        return {"ok": False, "reason": "bad_region"}
+                    import mss
+                    with mss.MSS() as sct:
+                        shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+                        bgra = shot.bgra
+                    import numpy as np
+                    image = np.frombuffer(bytearray(bgra), np.uint8).reshape(
+                        shot.height, shot.width, 4)[:, :, :3]
             finally:
                 if was_hidden:
                     wm.hide_window(hwnd)
@@ -3900,8 +4082,6 @@ class Api:
             # position/crop derived from it lands double-scaled. Identity
             # (and skipped) at the Windows norm.
             import cv2
-            import numpy as np
-            image = np.frombuffer(bytearray(bgra), np.uint8).reshape(shot.height, shot.width, 4)[:, :, :3]
             if image.shape[:2] != (config.FIXED_WIN_H, config.FIXED_WIN_W):
                 image = cv2.resize(image, (config.FIXED_WIN_W, config.FIXED_WIN_H), interpolation=cv2.INTER_AREA)
                 width, height = config.FIXED_WIN_W, config.FIXED_WIN_H
@@ -3955,14 +4135,11 @@ class Api:
             return {"ok": False, "reason": "no_roblox"}
 
         region = self.get_reward_region()
-        game_left, game_top, _, _ = wm.get_window_rect_screen(hwnd)
         path = os.path.join(_debug_dir(), "debug_reward_region.png")
 
         try:
             from core import rewards
-            image = rewards.capture_region(
-                game_left + region["x"], game_top + region["y"], region["width"], region["height"]
-            )
+            image = _capture_game_region(hwnd, region)
             rewards.save_region_preview(image, path)
         except Exception as exc:
             self.push_log(f"[Rewards] Preview failed: {exc}")
@@ -4011,15 +4188,12 @@ class Api:
 
         try:
             from core import rewards
-            from core.ocr import capture_region, sample_color_matches
 
-            image_top = capture_region(
-                game_left + region["x"], game_top + region["y"], region["width"], region["height"]
-            )
+            image_top = _capture_game_region(hwnd, region)
 
             probe_x, probe_y, probe_w, probe_h = REWARD_SCROLLBAR_PROBE
-            has_more = sample_color_matches(
-                game_left + probe_x, game_top + probe_y, probe_w, probe_h, REWARD_SCROLLBAR_COLOR,
+            has_more = _game_region_color_matches(
+                hwnd, probe_x, probe_y, probe_w, probe_h, REWARD_SCROLLBAR_COLOR,
                 tolerance=rewards.SCROLLBAR_TOLERANCE,
             )
             image_bottom = None
@@ -4056,9 +4230,7 @@ class Api:
                     time.sleep(0.02)
                 time.sleep(0.2)  # let the scroll-snap animation settle
 
-                image_bottom = capture_region(
-                    game_left + region["x"], game_top + region["y"], region["width"], region["height"]
-                )
+                image_bottom = _capture_game_region(hwnd, region)
                 # Move off the reward box once scrolling is done, same
                 # reasoning as core.runner's automatic post-match read.
                 self.mouse.move_to(game_left + 3, game_top + 3)
@@ -4127,15 +4299,11 @@ class Api:
             return {"ok": False, "reason": "no_roblox"}
 
         region = self.get_stats_region()
-        game_left, game_top, _, _ = wm.get_window_rect_screen(hwnd)
         path = os.path.join(_debug_dir(), "debug_game_stats.png")
 
         try:
             from core import game_stats
-            from core.ocr import capture_region
-            image = capture_region(
-                game_left + region["x"], game_top + region["y"], region["width"], region["height"]
-            )
+            image = _capture_game_region(hwnd, region)
             game_stats.save_region_preview(image, path)
         except Exception as exc:
             self.push_log(f"[Stats] Preview failed: {exc}")
@@ -4154,14 +4322,10 @@ class Api:
             return {"ok": False, "reason": "no_roblox"}
 
         region = self.get_stats_region()
-        game_left, game_top, _, _ = wm.get_window_rect_screen(hwnd)
 
         try:
             from core import game_stats
-            from core.ocr import capture_region
-            image = capture_region(
-                game_left + region["x"], game_top + region["y"], region["width"], region["height"]
-            )
+            image = _capture_game_region(hwnd, region)
             stats = game_stats.read_game_stats(image)
         except Exception as exc:
             self.push_log(f"[Stats] Read failed: {exc}")

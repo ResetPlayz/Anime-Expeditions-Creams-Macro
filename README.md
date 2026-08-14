@@ -102,15 +102,28 @@ pip install -r requirements.txt
 
 ### macOS (experimental — testers wanted)
 
-Releases also publish **`Creams-Macro-Anime-Expeditions-macOS.zip`** (a `.app` + the same editable `Assets/` folder), and source runs work via `./run.sh`. Key differences and setup:
+Releases also publish **`Creams-Macro-Anime-Expeditions-macOS.zip`** (an Intel/x86_64 `.app` + the same editable `Assets/` folder), and source runs work via `./run.sh`. Key differences and setup:
 
 1. **Permissions (required):** System Settings > Privacy & Security — grant the app (or your terminal, for source runs) **Accessibility**, **Input Monitoring**, and **Screen Recording**. Without them, clicks silently do nothing and captures come back black. The app logs a warning at startup if Accessibility is missing.
 2. **Side-by-side, not docked:** macOS can't embed another app's window, so Roblox is auto-arranged *next to* the control panel at the exact reference size instead of inside it. The panel sizes itself to whatever width the game doesn't need and to the full height of the screen's *visible* area (menu bar and Dock excluded), so nothing ends up under either.
 3. **Screen space:** side-by-side needs about **1564 logical points of width** (400 panel + 1152 game). If your display is set to fewer — a 13" MacBook left at its default scaled resolution is 1440 or even 1280 wide — Roblox lands partly off-screen; the app logs exactly this at startup. Fix it in System Settings > Displays by picking a resolution toward **"More Space"** (this is about *logical* points, not the physical panel, so a Retina display stays sharp).
-4. **The Dashboard drops the game slot.** On Windows the Dashboard reserves a 1152×756 hole for the embedded game; on mac there is nothing to put in it, so the Dashboard reflows to a single column — status, scoreboard, controls, run history, then the log — and the window widens to the full screen on the Task / Macro Manager / Challenge / Settings screens, which are multi-column and need the room. It stays narrow on the Dashboard so Roblox is visible beside it, and **never widens mid-run** (covering the game would break the reward/wave OCR, which reads the screen rather than the window).
+4. **The Dashboard drops the game slot.** On Windows the Dashboard reserves a 1152×756 hole for the embedded game; on mac there is nothing to put in it, so the Dashboard reflows to a single column — status, scoreboard, controls, run history, then the log — and the window widens to the full screen on the Task / Macro Manager / Challenge / Settings screens, which are multi-column and need the room. It stays narrow on the Dashboard so Roblox is visible beside it, and widens freely on the other screens even **mid-run** — reward/stats OCR reads Roblox's own window contents (window-content capture, see core/vision.py) rather than the screen, so covering the game doesn't break detection. (One deliberate exception: the placement-highlight scan is a small screen grab on mac because the highlight can be missing from window-content capture — see core/runner_blocks.py. Like all mac input it needs Roblox frontmost, which the runner re-establishes whenever it interacts.)
 5. **Scaling:** all captures are normalized and clicks scaled automatically (Retina 2x included), so the same Assets images work — but expect to add your own crops via the Image Manager where Roblox's mac rendering differs. Image matching reads Roblox's own window contents rather than the screen, so another window sitting over the game doesn't break detection.
-6. **Self-update** isn't wired up for the mac build yet — replace the app with a freshly downloaded zip.
+6. **Self-update** swaps the whole `.app` bundle in place (like the Windows exe swap), and the signed bundle is preserved as-is — so your permissions carry over (see below).
 7. Global hotkeys need elevated permissions on macOS; without them, use the on-screen buttons.
+
+### macOS permission persistence across updates
+
+macOS remembers the Accessibility, Input Monitoring, and Screen Recording grants you approve by the app's **code identity**, not its name or location. An *ad-hoc* signature has no certificate, so that identity is the build's `cdhash` — which changes every build, making each update look like a brand-new app and re-prompting you for every permission. That is the "stuck in a permission loop" behavior.
+
+Release builds are now signed with a **stable, self-signed code-signing certificate** created once and reused for every build, so every update is "the same app" to macOS and the grants you approved once keep working.
+
+- **Testers:** nothing to do beyond the normal one-time grants in step 1.
+- **Owner / release builds:** the stable identity lives in a certificate stored as two GitHub Actions repo secrets. Generate it once with `tools/make_macos_codesign_cert.sh` (any machine with OpenSSL), then add the two secrets it prints:
+  - `MACOS_CODESIGN_P12` — the single-line base64 of the `.p12`
+  - `MACOS_CODESIGN_PASSWORD` — the `.p12` password
+
+  With those secrets set, the macOS CI jobs import the cert into a throwaway keychain and sign with it automatically. Without them, CI still builds — it just falls back to ad-hoc signing, so a one-off test build re-prompts after each update.
 
 Either way, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) if you haven't already (needed for stats/reward reading only — everything else works without it).
 

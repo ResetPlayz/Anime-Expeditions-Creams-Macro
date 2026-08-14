@@ -167,6 +167,15 @@ function showDocked() {
   // Last: the window is now at its docked size, so a queued welcome opens
   // into something readable. showOnboarding hides the game itself.
   runPendingFirstRun();
+
+  // macOS: docking (re)arranges the panel back to the narrow strip beside
+  // Roblox. If the user was on a non-Dashboard screen when Roblox appeared
+  // (or reappeared after a relaunch), that strip leaves the multi-column
+  // editor clipped. Re-assert the width the current screen needs -- the
+  // first-ever dock just switched to Dashboard above, which keeps the strip.
+  if (IS_MAC) {
+    try { window.pywebview && pywebview.api.set_panel_expanded(currentScreen !== 'dashboard'); } catch (e) {}
+  }
 }
 
 // Set by the two capture dances (usePlaceUnitRobloxScreen /
@@ -797,16 +806,22 @@ function filterSettings(query) {
       contentCopy.querySelectorAll('.setting-row').forEach(row => row.remove());
       const panelContentText = (contentCopy.textContent || '').toLowerCase();
       const panelContentHit = !!q && panelContentText.includes(q);
+      // A search for a panel's own title (for example "Macro Coordinates")
+      // should show the panel's controls, not leave only its header and
+      // description visible. The old code kept the panel because the header
+      // matched, but had already hidden every row because none of the row
+      // labels matched the same query.
+      const headerText = (panel.querySelector('.rp-panel-head')?.textContent || '').toLowerCase();
+      const headerHit = !!q && headerText.includes(q);
       panel.querySelectorAll('.setting-row').forEach(row => {
         const text = (row.textContent || '').toLowerCase();
-        const hit = !q || panelContentHit || text.includes(q);
+        const hit = !q || headerHit || panelContentHit || text.includes(q);
         row.classList.toggle('search-hidden', !hit);
-        row.classList.toggle('search-hit', hit && !!q && !panelContentHit);
+        row.classList.toggle('search-hit', hit && !!q && !headerHit && !panelContentHit);
         if (hit) panelHasHit = true;
       });
       // Also check the panel header text (e.g. "Webhook", "General")
-      const headerText = (panel.querySelector('.rp-panel-head')?.textContent || '').toLowerCase();
-      if (q && headerText.includes(q)) panelHasHit = true;
+      if (headerHit) panelHasHit = true;
       if (panelContentHit) panelHasHit = true;
       panel.classList.toggle('search-hidden', !panelHasHit && !!q);
       if (panelHasHit) catHasHit = true;
@@ -2000,6 +2015,7 @@ async function loadWebhookUI() {
     document.getElementById('webhook-mention-id').value = wh.mention_id || '';
     document.getElementById('toggle-webhook-enabled').classList.toggle('on', !!wh.enabled);
     document.getElementById('toggle-webhook-silent').classList.toggle('on', !!wh.silent);
+    document.getElementById('toggle-webhook-progress').classList.toggle('on', !!wh.progress);
     updateWebhookValidity(wh.url || '');
   } catch (e) {}
 }
@@ -2110,8 +2126,9 @@ async function saveWebhookSettings(silentSave) {
   const mentionId = document.getElementById('webhook-mention-id').value.trim();
   const enabled = document.getElementById('toggle-webhook-enabled').classList.contains('on');
   const silent = document.getElementById('toggle-webhook-silent').classList.contains('on');
+  const progress = document.getElementById('toggle-webhook-progress').classList.contains('on');
   try {
-    await pywebview.api.save_webhook_settings(url, enabled, silent, mentionId);
+    await pywebview.api.save_webhook_settings(url, enabled, silent, mentionId, progress);
     updateWebhookValidity(url);
     if (!silentSave) setWebhookStatus('Saved.', 'var(--teal)');
   } catch (e) {
@@ -2131,7 +2148,7 @@ async function saveWebhookSettings(silentSave) {
 const TASK_DATA = {
   story: {
     label: 'Story',
-    maps: ['School Grounds', 'Rose Kingdom', 'Fairy King Forest', "King's Tomb", 'Flower Forest'],
+    maps: ['School Grounds', 'Rose Kingdom', 'Fairy King Forest', "King's Tomb", 'Flower Forest', 'East Town'],
     stages: ['1', '2', '3', '4', '5', 'Infinite', 'Mastery'],
     difficulties: ['Normal', 'Hard'],
   },
@@ -2143,7 +2160,7 @@ const TASK_DATA = {
   },
   expedition: {
     label: 'Expedition',
-    maps: ['School Grounds', 'Flower Forest', 'Rose Kingdom'],
+    maps: ['School Grounds', 'Flower Forest', 'Rose Kingdom', 'East Town'],
     difficulties: ['1', '2', '3'],
     // How many "exp_extract" prompts to decline before actually taking
     // one -- 0 extracts at the first one shown, 1 (default, matches the
@@ -2177,6 +2194,12 @@ const TASK_DATA = {
     // Matchmaking isn't offered: "Solo Tournament" already is the mode.
     maps: ['Solo Tournament'],
     isTournament: true,
+  },
+  tower: {
+    label: 'Tower',
+    maps: ['Rose Kingdom'],  // internal default only -- Tower has no map picker in-game
+    stages: ['1'],
+    isTower: true,
   },
 };
 
@@ -2347,7 +2370,8 @@ async function exportSettings() {
     };
     const result = await pywebview.api.export_tasks_file(payload, 'settings');
     if (result && result.ok) addLog(`[Settings] Exported settings to ${result.path}`);
-    else if (result && result.reason !== 'cancelled') addLog(`[Settings] Export failed: ${result.reason || 'error'}`);
+    else if (result && result.reason === 'cancelled') addLog('[Settings] Export cancelled.');
+    else if (result) addLog(`[Settings] Export failed: ${result.reason || 'error'}`);
   } catch (e) {
     addLog(`[Settings] Export failed: ${e.message || e}`);
   }
@@ -2357,7 +2381,13 @@ async function importSettings() {
   try {
     const result = await pywebview.api.import_tasks_file();
     if (!result || !result.ok) {
-      if (result && result.reason !== 'cancelled') addLog(`[Settings] Import failed: ${result.reason || 'error'}`);
+      if (!result) {
+        addLog('[Settings] Import failed: the file dialog could not be opened.');
+      } else if (result.reason === 'cancelled') {
+        addLog('[Settings] Import cancelled.');
+      } else {
+        addLog(`[Settings] Import failed: ${result.reason || 'error'}`);
+      }
       return;
     }
     const data = result.data || {};
@@ -2417,16 +2447,27 @@ async function exportTasks() {
     tasks: taskCards, templates, paths, recordings,
   };
   let result = null;
-  try { result = await pywebview.api.export_tasks_file(payload); } catch (e) {}
+  let errMsg = null;
+  try { result = await pywebview.api.export_tasks_file(payload); } catch (e) { errMsg = (e && e.message) || String(e); }
   if (result && result.ok) addLog(`[Task] Exported ${taskCards.length} task(s) to ${result.path}`);
-  else if (result && result.reason !== 'cancelled') addLog(`[Task] Export failed: ${result.reason || 'error'}`);
+  else if (!result) addLog(`[Task] Export failed: the save dialog could not be opened${errMsg ? ` (${errMsg})` : ''}.`);
+  else if (result.reason === 'cancelled') addLog('[Task] Export cancelled.');
+  else addLog(`[Task] Export failed: ${result.reason || 'error'}`);
 }
 
 async function importTasks() {
   let result = null;
-  try { result = await pywebview.api.import_tasks_file('tasks'); } catch (e) {}
+  let errMsg = null;
+  try { result = await pywebview.api.import_tasks_file('tasks'); }
+  catch (e) { errMsg = (e && e.message) || String(e); }
   if (!result || !result.ok) {
-    if (result && result.reason !== 'cancelled') addLog(`[Task] Import failed: ${result.reason || 'error'}`);
+    if (!result) {
+      addLog(`[Task] Import failed: the file dialog could not be opened${errMsg ? ` (${errMsg})` : ''}.`);
+    } else if (result.reason === 'cancelled') {
+      addLog('[Task] Import cancelled.');
+    } else {
+      addLog(`[Task] Import failed: ${result.reason || 'error'}`);
+    }
     return;
   }
   const data = result.data || {};
@@ -2689,6 +2730,12 @@ function setTaskProp(id, key, value) {
     // 'matchmaking'. Force it so switching from a matchmaking task can't leave
     // Tournament silently waiting on an Enter Matchmaking button.
     if (d.isTournament) t.play_mode = 'solo';
+    if (d.isTower) {
+      t.map = d.maps[0];
+      t.stage = d.stages[0];
+      if (!t.tower_mode) t.tower_mode = 'normal';
+      t.play_mode = 'solo';
+    }
   }
   if (key === 'stage' && value === 'Infinite' && !Number.isInteger(Number(t.infinite_wave_limit))) {
     t.infinite_wave_limit = DEFAULT_INFINITE_WAVE_LIMIT;
@@ -2703,7 +2750,7 @@ function taskOpts(list, current, fmt) {
 }
 
 // One accent per mode so the queue scans by color before you even read it.
-const TASK_MODE_COLORS = { story: 'var(--brand)', raid: 'var(--rose)', expedition: 'var(--teal)', event: 'var(--amber)', tournament: 'var(--lilac)' };
+const TASK_MODE_COLORS = { story: 'var(--brand)', raid: 'var(--rose)', expedition: 'var(--teal)', event: 'var(--amber)', tournament: 'var(--lilac)', tower: 'var(--slate)' };
 
 // The two text lines a queue row shows for a task -- where it goes, then how
 // it runs. All editing happens in the Builder, rows are read-only summaries.
@@ -2725,7 +2772,8 @@ function taskSummary(t) {
     diff,
     t.mode === 'story' && t.stage === 'Infinite'
       ? `Stop after wave ${t.infinite_wave_limit || DEFAULT_INFINITE_WAVE_LIMIT}` : '',
-    t.mode === 'tournament' ? '' : (t.play_mode === 'matchmaking' ? 'Matchmaking' : 'Solo'),
+    t.tower_mode === 'traitless' ? 'Traitless' : '',
+    (t.mode === 'tournament' || t.mode === 'tower') ? '' : (t.play_mode === 'matchmaking' ? 'Matchmaking' : 'Solo'),
     t.macro ? `▸ ${t.macro}` : '',
     (t.mode === 'event' && t.stage !== '4' && t.act4_on_drop)
       ? `⮡ Act 4 on drop${t.act4_mode === 'until_locked' ? ' (until locked)' : ''}` : '',
@@ -2796,7 +2844,7 @@ function renderTaskBuilder() {
   const field = (label, control, tooltip = '') => `<div class="task-field" ${tooltip ? `data-tooltip="${escapeHtml(tooltip)}"` : ''}><span>${label}</span>${control}</div>`;
 
   const fields = [
-    field('Mode', sel('mode', Object.keys(TASK_DATA), k => TASK_DATA[k].label, 'Select game mode: Story, Raid, Expedition, or Event'), 'Choose game mode'),
+    field('Mode', sel('mode', Object.keys(TASK_DATA), k => TASK_DATA[k].label, 'Select game mode: Story, Raid, Expedition, Event, Tournament, or Tower'), 'Choose game mode'),
     field('Repeat', `<div class="task-rep-group" style="width: 100%;">&times;<input type="number" min="1" value="${t.repeat}"
       oninput="setTaskProp('${t.id}', 'repeat', Math.max(1, parseInt(this.value, 10) || 1))"></div>`, 'Number of times to run this task'),
   ];
@@ -2811,6 +2859,15 @@ function renderTaskBuilder() {
     fields.push(field('Act', sel('stage', d.stages, s => 'Act ' + s, 'Select Event Act 1-4'), 'Select Event Act 1-4'));
   } else if (t.mode === 'tournament') {
     fields.push(field('Type', sel('map', d.maps, null, 'Select the Tournament type to enter'), 'Select the Tournament type to enter'));
+  } else if (t.mode === 'tower') {
+    // Tower has no map choice in-game -- map stays at its internal default.
+    const towerMode = t.tower_mode || 'normal';
+    const towerSeg = `
+      <div class="seg-toggle">
+        <button type="button" class="seg-btn ${towerMode !== 'traitless' ? 'active' : ''}" onclick="setTaskProp('${t.id}', 'tower_mode', 'normal'); renderTaskBuilder()">Normal</button>
+        <button type="button" class="seg-btn ${towerMode === 'traitless' ? 'active' : ''}" onclick="setTaskProp('${t.id}', 'tower_mode', 'traitless'); renderTaskBuilder()">Traitless</button>
+      </div>`;
+    fields.push(field('Tower Mode', towerSeg));
   }
 
   const specialStage = t.mode === 'story' && (t.stage === 'Infinite' || t.stage === 'Mastery');
@@ -2833,10 +2890,9 @@ function renderTaskBuilder() {
       `Number of extraction prompts to decline before extracting (maximum ${MAX_EXTRACT_AFTER})`));
   }
 
-  // Tournament has no Solo/Matchmaking choice -- "Solo Tournament" is already
-  // the mode, and the runner forces the solo Start tail for it (see
-  // setTaskProp's mode switch), so the toggle would be a no-op here.
-  if (t.mode !== 'tournament') {
+  // Tournament and Tower have no Solo/Matchmaking choice -- their runner paths
+  // force the solo Start tail, so the toggle would be a no-op here.
+  if (t.mode !== 'tournament' && t.mode !== 'tower') {
     const playSeg = `
       <div class="seg-toggle" data-tooltip="Select Solo or Matchmaking / Party mode">
         <button type="button" class="seg-btn ${t.play_mode === 'solo' ? 'active' : ''}" onclick="setTaskProp('${t.id}', 'play_mode', 'solo'); renderTaskBuilder()">Solo</button>
@@ -3040,15 +3096,17 @@ async function refreshTaskQueue() {
 // Challenge screen: Regular Challenge automation
 // ---------------------------------------------------------------------------
 // Regular Challenge has 3 fixed stage slots that each rotate through one of
-// the 5 Story maps over time (see main.py's CHALLENGE_STORY_MAPS comment) --
+// the Story maps over time (see main.py's CHALLENGE_STORY_MAPS comment) --
 // config here is split the same way the backend models it: the daily play
 // limit tracks each STAGE SLOT (whichever map is currently rotated into it),
 // while Macro Operation assignment is tracked per MAP, since that's what
 // needs to follow the map around as it rotates through slots.
 const CHALLENGE_STAGE_SLOTS = ['1', '2', '3'];
 // Mirrors main.py's CHALLENGE_STORY_MAPS -- keep in sync if Story's map
-// list (TASK_DATA.story.maps) ever changes.
-const CHALLENGE_STORY_MAPS = ['School Grounds', 'Rose Kingdom', 'Fairy King Forest', "King's Tomb", 'Flower Forest'];
+// list (TASK_DATA.story.maps) ever changes. This list is what renders the
+// Story Map Setup rows, so a map missing here cannot be assigned a Macro
+// Operation at all; tests/test_challenge_maps.py fails when it drifts.
+const CHALLENGE_STORY_MAPS = ['School Grounds', 'Rose Kingdom', 'Fairy King Forest', "King's Tomb", 'Flower Forest', 'East Town'];
 let challengeState = null;
 
 function renderStoryMapSetupWarning(id, state, featureName) {
@@ -3288,6 +3346,10 @@ function renderBountyScreen() {
   }
   document.getElementById('toggle-bounty-enabled')?.classList.toggle(
     'on', !!(s && s.enabled && s.setup_ready));
+  document.getElementById('toggle-bounty-mythic')?.classList.toggle(
+    'on', !!(s && s.mythic_only));
+  const mythicMax = document.getElementById('bounty-mythic-max-rerolls');
+  if (mythicMax && s) mythicMax.value = s.mythic_max_rerolls || 20;
   const playMode = (s && s.play_mode) || 'solo';
   document.getElementById('bounty-mode-solo')?.classList.toggle('active', playMode === 'solo');
   document.getElementById('bounty-mode-matchmaking')?.classList.toggle('active', playMode === 'matchmaking');
@@ -3337,6 +3399,18 @@ async function toggleBountyEnabled(btn) {
   await refreshBountyScreen();
 }
 
+async function toggleBountyMythic(btn) {
+  const isOn = !btn.classList.contains('on');
+  bounceToggle(btn);
+  try { await pywebview.api.set_bounty_mythic_only(isOn); } catch (e) {}
+  await refreshBountyScreen();
+}
+
+async function setBountyMythicMaxRerolls(value) {
+  try { await pywebview.api.set_bounty_mythic_max_rerolls(value); } catch (e) {}
+  await refreshBountyScreen();
+}
+
 async function setBountyPlayMode(playMode) {
   try { await pywebview.api.set_bounty_play_mode(playMode); } catch (e) {}
   await refreshBountyScreen();
@@ -3383,6 +3457,37 @@ function formatFuelCountdown(seconds) {
   const minutes = Math.floor((total % 3600) / 60);
   const secs = total % 60;
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function normalizeFuelIntervalInput(value, unit) {
+  const amount = Math.max(1, parseInt(value, 10) || 1);
+  return unit === 'hours' ? amount * 60 : amount;
+}
+
+function renderFuelIntervalControl() {
+  const minutes = Math.max(0, parseInt(fuelState && fuelState.interval_minutes, 10) || 0);
+  const input = document.getElementById('fuel-interval-value');
+  const unit = document.getElementById('fuel-interval-unit');
+  const controls = document.getElementById('fuel-interval-controls');
+  const autoButton = document.getElementById('fuel-interval-auto');
+  const isAuto = minutes === 0;
+  if (autoButton) autoButton.classList.toggle('active', isAuto);
+  if (controls) {
+    controls.style.display = 'flex';
+    controls.style.opacity = '1';
+  }
+  if (input && unit) {
+    if (isAuto) {
+      input.value = '';
+      unit.value = 'minutes';
+    } else if (minutes >= 60 && minutes % 60 === 0) {
+      input.value = minutes / 60;
+      unit.value = 'hours';
+    } else {
+      input.value = minutes;
+      unit.value = 'minutes';
+    }
+  }
 }
 
 function renderFuelTimers() {
@@ -3443,6 +3548,7 @@ async function refreshFuelScreen() {
       amountInput.style.visibility = isMax ? 'hidden' : 'visible';
     }
   }
+  renderFuelIntervalControl();
   renderFuelTimers();
   renderFuelPaths();
 }
@@ -3476,6 +3582,23 @@ async function setFuelResourceAmount(resource, amount) {
     ? 'max'
     : Math.max(1, Math.min(100, parseInt(amount, 10) || 1));
   try { await pywebview.api.set_fuel_resource_amount(resource, normalized); } catch (e) {}
+  await refreshFuelScreen();
+}
+
+async function setFuelIntervalValue() {
+  const input = document.getElementById('fuel-interval-value');
+  const unit = document.getElementById('fuel-interval-unit');
+  const minutes = normalizeFuelIntervalInput(input ? input.value : 1, unit ? unit.value : 'minutes');
+  try { await pywebview.api.set_fuel_interval(minutes); } catch (e) {}
+  await refreshFuelScreen();
+}
+
+async function setFuelIntervalAuto(btn) {
+  if (btn) {
+    btn.classList.add('active');
+    bounceToggle(btn);
+  }
+  try { await pywebview.api.set_fuel_interval(0); } catch (e) {}
   await refreshFuelScreen();
 }
 
@@ -4361,11 +4484,13 @@ const MACRO_COORD_KEYS = [
   'story_click_x', 'story_click_y',
   'stage_row_x', 'stage_row_y', 'stage_row_height',
   'act_row_x', 'act_row_y', 'act_row_height',
+  'event_gamemode_x', 'event_gamemode_y',
   'challenge_stage_1_x', 'challenge_stage_1_y',
   'challenge_stage_2_x', 'challenge_stage_2_y',
   'challenge_stage_3_x', 'challenge_stage_3_y',
   'expedition_difficulty_x', 'expedition_difficulty_y',
   'team_loadout_x', 'team_loadout_y', 'team_loadout_row_height',
+  'team_button_x', 'team_button_y',
   'screen_middle_x', 'screen_middle_y',
   'unit_info_reset_x', 'unit_info_reset_y',
 ];
@@ -4383,6 +4508,19 @@ async function setMacroCoord(key, value) {
   const n = parseInt(value);
   if (Number.isNaN(n)) return;
   try { await pywebview.api.set_macro_coord(key, n); } catch (e) {}
+}
+
+async function clearMacroCoord(prefix) {
+  try {
+    const result = await pywebview.api.clear_macro_coord(prefix);
+    if (result && result.ok) {
+      for (const suffix of ['_x', '_y']) {
+        const el = document.getElementById(`coord-${prefix}${suffix}`);
+        if (el) el.value = '';
+      }
+      addLog(`[Debug] ${prefix} coordinate override cleared -- using Auto.`);
+    }
+  } catch (e) {}
 }
 
 // Several coordinate keys in one atomic write (see set_macro_coords) -- the
@@ -5821,7 +5959,7 @@ const IMAGE_DESCRIPTIONS = {
   chal_select: "The Challenge mode select button.",
   challenge: "The Challenge card on the Play menu.",
   challenge_loaded: "Confirms the Challenge screen finished loading.",
-  click_anywhere_to_close: "The 'Click anywhere to close' popup (e.g. a Raid boss cutscene).",
+  click_anywhere_to_close: "The Spirit City Act 3 Raid popup. Click-text, sword, Lvl 1, and 8th Sword image variants are all fallback signals for dismissing it.",
   confirm: "The Confirm button -- e.g. confirming a Team Loadout.",
   continue_2: "The smaller second 'Continue' button in Expedition wave transitions.",
   defeat: "The Defeat result screen -- how the macro knows a run was lost.",
@@ -6849,16 +6987,27 @@ async function exportTemplates() {
     templates, paths, recordings,
   };
   let result = null;
-  try { result = await pywebview.api.export_tasks_file(payload, 'templates'); } catch (e) {}
+  let errMsg = null;
+  try { result = await pywebview.api.export_tasks_file(payload, 'templates'); } catch (e) { errMsg = (e && e.message) || String(e); }
   if (result && result.ok) addLog(`[Macro Manager] Exported ${names.length} template(s) to ${result.path}`);
-  else if (result && result.reason !== 'cancelled') addLog(`[Macro Manager] Export failed: ${result.reason || 'error'}`);
+  else if (!result) addLog(`[Macro Manager] Export failed: the save dialog could not be opened${errMsg ? ` (${errMsg})` : ''}.`);
+  else if (result.reason === 'cancelled') addLog('[Macro Manager] Export cancelled.');
+  else addLog(`[Macro Manager] Export failed: ${result.reason || 'error'}`);
 }
 
 async function importTemplates() {
   let result = null;
-  try { result = await pywebview.api.import_tasks_file('templates'); } catch (e) {}
+  let errMsg = null;
+  try { result = await pywebview.api.import_tasks_file('templates'); }
+  catch (e) { errMsg = (e && e.message) || String(e); }
   if (!result || !result.ok) {
-    if (result && result.reason !== 'cancelled') addLog(`[Macro Manager] Import failed: ${result.reason || 'error'}`);
+    if (!result) {
+      addLog(`[Macro Manager] Import failed: the file dialog could not be opened${errMsg ? ` (${errMsg})` : ''}.`);
+    } else if (result.reason === 'cancelled') {
+      addLog('[Macro Manager] Import cancelled.');
+    } else {
+      addLog(`[Macro Manager] Import failed: ${result.reason || 'error'}`);
+    }
     return;
   }
   const data = result.data || {};

@@ -40,58 +40,76 @@ class ChallengeOps:
             return map_name
         return self._detect_challenge_map_ocr(hwnd)
 
+    def _challenge_map_ocr_crops(self, frame):
+        """Daily Challenge map label crops, HUD-anchored first and fixed relative fallback second."""
+        crops = []
+        try:
+            hud_match = vision.find_in_gray_multiscale(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), "daily_challenge_hud")
+        except vision.TemplateNotFound:
+            hud_match = None
+        if hud_match is not None:
+            x = max(0, hud_match["x"] + hud_match["w"] - 5)
+            y = max(0, hud_match["y"] - 7)
+            crop = frame[y:min(frame.shape[0], y + 43), x:frame.shape[1]]
+            if crop.size:
+                crops.append(crop)
+
+        h, w = frame.shape[:2]
+        x1 = max(0, int(w * 0.58))
+        y1 = max(0, int(h * 0.42))
+        x2 = min(w, int(w * 0.98))
+        y2 = min(h, int(h * 0.52))
+        fallback = frame[y1:y2, x1:x2]
+        if fallback.size:
+            crops.append(fallback)
+        return crops
+
     def _detect_challenge_map_ocr(self, hwnd) -> str:
         """Fallback for the tiny Daily Challenge map label shown in-game."""
         frame = vision.capture_game_bgr(hwnd)
         if frame is None:
             return None
 
-        # Anchor the crop to Daily Challenge's green HUD label instead of a
-        # fixed map-name position; longer names extend farther left.
-        try:
-            hud_match = vision.find_in_gray_multiscale(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), "daily_challenge_hud")
-        except vision.TemplateNotFound:
-            return None
-        if hud_match is None:
-            return None
-        x = max(0, hud_match["x"] + hud_match["w"] - 5)
-        y = max(0, hud_match["y"] - 7)
-        crop = frame[y:min(frame.shape[0], y + 43), x:frame.shape[1]]
-        if crop.size == 0:
-            return None
+        aliases = CHALLENGE_MAP_OCR_ALIASES
 
-        # The raw glyphs are only around 10px tall. Color upscaling preserves
-        # their white fill and dark outline better than a global threshold.
-        candidates = [
-            cv2.resize(crop, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC),
-            cv2.resize(crop, None, fx=8, fy=8, interpolation=cv2.INTER_LANCZOS4),
-        ]
-        candidates.extend(ocr.candidate_masks(crop, upscale=8))
-        texts = [ocr_windows.ocr_image(candidate) for candidate in candidates]
-        aliases = {
-            "School Grounds": "grounds",
-            "Rose Kingdom": "kingdom",
-            "Fairy King Forest": "fairy",
-            "King's Tomb": "tomb",
-            "Flower Forest": "flower",
-        }
-        for text in texts:
-            tokens = re.findall(r"[a-z]+", text.lower())
-            scores = sorted(
-                (
-                    max((difflib.SequenceMatcher(None, alias, token).ratio() for token in tokens), default=0),
-                    map_name,
+        try:
+            pytesseract = ocr.get_pytesseract()
+        except ocr.TesseractNotAvailable:
+            pytesseract = None
+
+        for crop in ChallengeOps._challenge_map_ocr_crops(self, frame):
+            # The raw glyphs are only around 10px tall. Color upscaling preserves
+            # their white fill and dark outline better than a global threshold.
+            candidates = [
+                cv2.resize(crop, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC),
+                cv2.resize(crop, None, fx=8, fy=8, interpolation=cv2.INTER_LANCZOS4),
+            ]
+            candidates.extend(ocr.candidate_masks(crop, upscale=8))
+            texts = [ocr.ocr_mask(pytesseract, candidate, "--psm 7") for candidate in candidates]
+            for text in texts:
+                # The label reads "<Map> - Act N", so every read carries the
+                # same boilerplate word alongside the part that identifies the
+                # map. Left in, it competes for the best score -- "act" sits
+                # about as close to "east" as a garbled "Tornb" does to "tomb",
+                # which collapses the runner-up margin below and rejects a read
+                # that was perfectly legible. Score only the words that can
+                # actually name a map.
+                tokens = [t for t in re.findall(r"[a-z]+", text.lower())
+                          if t not in CHALLENGE_MAP_OCR_STOPWORDS]
+                scores = sorted(
+                    (
+                        max((difflib.SequenceMatcher(None, alias, token).ratio() for token in tokens), default=0),
+                        map_name,
+                    )
+                    for map_name, alias in aliases.items()
                 )
-                for map_name, alias in aliases.items()
-            )
-            best_score, best_map = scores[-1]
-            runner_up = scores[-2][0]
-            if best_score >= 0.65 and best_score - runner_up >= 0.12:
-                self._log(
-                    f'[Macro] Challenge map OCR: "{text.strip()}" -> '
-                    f'"{best_map}" (score {best_score:.2f}).')
-                return best_map
+                best_score, best_map = scores[-1]
+                runner_up = scores[-2][0]
+                if best_score >= 0.65 and best_score - runner_up >= 0.12:
+                    self._log(
+                        f'[Macro] Challenge map OCR: "{text.strip()}" -> "{best_map}" (score {best_score:.2f}).')
+                    return best_map
         return None
 
     def _challenge_has_ready_stage(self) -> bool:
@@ -174,16 +192,15 @@ class ChallengeOps:
             return
 
         cap = challenge.get("cap", 0)
+        # Freeze this pass's ordered work before starting it. All regular
+        # slots share one :00/:30 readiness window; repeatedly deciding the
+        # work between battles could otherwise let a boundary or settings
+        # refresh turn a 1 -> 2 -> 3 interruption into several one-slot
+        # interruptions. Once we leave a task for Challenge, finish every
+        # slot that was eligible at that point, in numeric order, before
+        # returning to the task.
+        pending_slots = []
         for slot in CHALLENGE_STAGE_SLOTS:
-            if self._checkpoint(stop_event):
-                return
-            # Re-fetched every slot -- a stage just played updates its own
-            # count/cooldown, and this whole pass can span several minutes.
-            try:
-                challenge = self._get_challenge_settings()
-            except Exception as exc:
-                self._log(f"[Macro] Couldn't read Challenge settings: {exc}")
-                return
             info = challenge.get("stages", {}).get(slot) or {}
             if not info.get("enabled"):
                 continue
@@ -191,11 +208,20 @@ class ChallengeOps:
                 self._log(f'[Macro] Challenge #{slot} is at today\'s cap ({cap}) -- skipping.')
                 continue
             if not info.get("ready"):
-                # Already played this slot since the current :00/:30 window
-                # opened -- "ready" is computed by get_challenge_settings
-                # against that single fixed clock, same for all 3 slots.
                 self._log(f'[Macro] Challenge #{slot} already played this window -- skipping.')
                 continue
+            pending_slots.append(slot)
+
+        for slot in pending_slots:
+            if self._checkpoint(stop_event):
+                return
+            # Refresh map/mode configuration, but do not re-decide the slot
+            # list: completing 1 must lead to 2 then 3 from this same pass.
+            try:
+                challenge = self._get_challenge_settings()
+            except Exception as exc:
+                self._log(f"[Macro] Couldn't read Challenge settings: {exc}")
+                return
 
             play_mode = challenge.get("play_mode") or "solo"
             result = self._run_one_challenge_stage(hwnd, stop_event, slot, play_mode, challenge, coords,
@@ -243,29 +269,97 @@ class ChallengeOps:
         just doesn't consume a daily-cap count -- see
         mark_challenge_stage_played's count_play); only None leaves the
         slot ready, so a technical failure can be retried this window."""
+        progress_task = {
+            "mode": "challenge", "map": f"Challenge #{slot}",
+            "stage": str(slot), "play_mode": play_mode,
+        }
+        self._send_progress_webhook(
+            webhook,
+            progress_task,
+            f"Challenge #{slot} Started",
+            f"Starting Challenge #{slot} ({play_mode}).",
+            0x5865F2,
+            extra_fields=[{"name": "Play Mode", "value": play_mode, "inline": True}],
+            current_action=f"Challenge #{slot} -- entering ({play_mode})",
+            next_phase="Identify the assigned map, then start the battle",
+        )
         self._log(f"[Macro] Challenge #{slot}: entering ({play_mode})...")
         self._set_status(current_task=f"Challenge #{slot}", map="-", action="Entering Challenge...",
                           mode="challenge", stage="-", difficulty="-", play_mode=play_mode, macro="-")
-        if not self._enter_challenge_stage(hwnd, stop_event, slot, play_mode, coords, webhook):
-            return None
-        if self._checkpoint(stop_event):
-            return None
-        return self._run_challenge_battle(
-            hwnd, stop_event, f"Challenge #{slot}", play_mode, challenge, default_walk_paths, webhook)
+        result = None
+        try:
+            if not self._enter_challenge_stage(hwnd, stop_event, slot, play_mode, coords, webhook):
+                return None
+            if self._checkpoint(stop_event):
+                return None
+            result = self._run_challenge_battle(
+                hwnd, stop_event, f"Challenge #{slot}", play_mode, challenge, default_walk_paths, webhook)
+            return result
+        finally:
+            self._send_challenge_progress_finished(
+                webhook, progress_task, f"Challenge #{slot}", play_mode, result, stop_event)
 
     def _run_one_daily_challenge(self, hwnd, stop_event: threading.Event, play_mode: str,
                                   challenge: dict, coords: dict, default_walk_paths: dict,
                                   webhook: dict) -> str:
+        progress_task = {
+            "mode": "challenge", "map": "Daily Challenge",
+            "stage": "Daily", "play_mode": play_mode,
+        }
+        self._send_progress_webhook(
+            webhook,
+            progress_task,
+            "Daily Challenge Started",
+            f"Starting Daily Challenge ({play_mode}).",
+            0x5865F2,
+            extra_fields=[{"name": "Play Mode", "value": play_mode, "inline": True}],
+            current_action=f"Daily Challenge -- entering ({play_mode})",
+            next_phase="Identify the assigned map, then start the battle",
+        )
         self._log(f"[Macro] Daily Challenge: entering ({play_mode})...")
         self._set_status(current_task="Daily Challenge", map="-", action="Entering Daily Challenge...",
                           mode="challenge", stage="Daily", difficulty="-", play_mode=play_mode, macro="-")
-        entry = self._enter_daily_challenge_stage(hwnd, stop_event, play_mode, coords, webhook)
-        if entry != "entered":
-            return entry
-        if self._checkpoint(stop_event):
-            return None
-        return self._run_challenge_battle(
-            hwnd, stop_event, "Daily Challenge", play_mode, challenge, default_walk_paths, webhook)
+        result = None
+        try:
+            entry = self._enter_daily_challenge_stage(hwnd, stop_event, play_mode, coords, webhook)
+            if entry != "entered":
+                result = entry
+                return entry
+            if self._checkpoint(stop_event):
+                return None
+            result = self._run_challenge_battle(
+                hwnd, stop_event, "Daily Challenge", play_mode, challenge, default_walk_paths, webhook)
+            return result
+        finally:
+            self._send_challenge_progress_finished(
+                webhook, progress_task, "Daily Challenge", play_mode, result, stop_event)
+
+    def _send_challenge_progress_finished(self, webhook: dict, task: dict, label: str,
+                                           play_mode: str, result: str,
+                                           stop_event: threading.Event) -> None:
+        if result == "win":
+            status, color = "Victory", 0x3FBF6F
+        elif result == "loss":
+            status, color = "Defeat", 0xE05A6D
+        elif result == "unavailable":
+            status, color = "Unavailable", 0xE8935A
+        elif stop_event.is_set():
+            status, color = "Stopped", 0xE8935A
+        else:
+            status, color = "Failed", 0xE05A6D
+        self._send_progress_webhook(
+            webhook,
+            task,
+            f"{label} Finished",
+            f"{label} finished: **{status}**.",
+            color,
+            extra_fields=[
+                {"name": "Status", "value": status, "inline": True},
+                {"name": "Play Mode", "value": play_mode, "inline": True},
+            ],
+            current_action=f"{label} -- {status}",
+            next_phase=self._next_challenge_progress(),
+        )
 
     def _run_challenge_battle(self, hwnd, stop_event: threading.Event, label: str, play_mode: str,
                                challenge: dict, default_walk_paths: dict, webhook: dict) -> str:

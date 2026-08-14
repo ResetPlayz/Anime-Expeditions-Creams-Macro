@@ -54,6 +54,45 @@ def run_js(body, tmp_path):
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+def test_fuel_interval_input_converts_hours_to_minutes(tmp_path):
+    out = run_js("""
+        eval(extract('normalizeFuelIntervalInput'));
+        console.log(JSON.stringify([
+          normalizeFuelIntervalInput('30', 'minutes'),
+          normalizeFuelIntervalInput('2', 'hours'),
+          normalizeFuelIntervalInput('bad', 'hours')
+        ]));
+    """, tmp_path)
+    assert out == [30, 120, 60]
+
+
+def test_fuel_interval_input_stays_editable_in_auto_mode(tmp_path):
+    out = run_js("""
+        let fuelState = {interval_minutes: 0};
+        const elements = {
+          'fuel-interval-value': {value: '30'},
+          'fuel-interval-unit': {value: 'hours'},
+          'fuel-interval-controls': {style: {}},
+          'fuel-interval-auto': {classList: {toggle() {}}},
+        };
+        const document = {getElementById: id => elements[id] || null};
+        eval(extract('renderFuelIntervalControl'));
+        renderFuelIntervalControl();
+        console.log(JSON.stringify({
+          display: elements['fuel-interval-controls'].style.display,
+          opacity: elements['fuel-interval-controls'].style.opacity,
+          input: elements['fuel-interval-value'].value,
+          unit: elements['fuel-interval-unit'].value,
+        }));
+    """, tmp_path)
+    assert out == {
+        "display": "flex",
+        "opacity": "1",
+        "input": "",
+        "unit": "minutes",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Infinite task wave limit
 # ---------------------------------------------------------------------------
@@ -144,6 +183,43 @@ def test_tournament_task_summary_names_its_type_and_hides_play_mode(tmp_path):
     assert "Boss Rush" in out["meta"]
 
 
+def test_tower_mode_defaults_to_rose_kingdom_and_traitless_summary_chip(tmp_path):
+    out = run_js("""
+        const TASK_DATA = {
+          story: { label: 'Story', maps: ['School Grounds'], stages: ['1'], difficulties: ['Normal'] },
+          tower: {
+            label: 'Tower',
+            maps: ['Rose Kingdom', 'School Grounds', 'Flower Forest', 'Fairy King Forest', "King's Tomb", 'East Town'],
+            stages: ['1'],
+            isTower: true,
+          },
+        };
+        const DEFAULT_INFINITE_WAVE_LIMIT = 20;
+        let taskCards = [{
+          id: 't1', mode: 'story', map: 'School Grounds', stage: '1', difficulty: 'Normal',
+          repeat: 1, play_mode: 'matchmaking', macro: ''
+        }];
+        function findTask(id) { return taskCards.find(t => t.id === id); }
+        function updateQueueRowInPlace() {}
+        function renderTaskBuilder() {}
+        function saveTaskQueue() {}
+        eval(extract('setTaskProp'));
+        eval(extract('taskSummary'));
+        setTaskProp('t1', 'mode', 'tower');
+        const normal = {...taskCards[0]};
+        setTaskProp('t1', 'tower_mode', 'traitless');
+        console.log(JSON.stringify({normal, summary: taskSummary(taskCards[0])}));
+    """, tmp_path)
+    assert out["normal"]["map"] == "Rose Kingdom"
+    assert out["normal"]["stage"] == "1"
+    assert out["normal"]["play_mode"] == "solo"
+    assert out["normal"]["tower_mode"] == "normal"
+    assert out["summary"]["title"] == "Tower"
+    assert "Traitless" in out["summary"]["meta"]
+    assert "Solo" not in out["summary"]["meta"] and "Matchmaking" not in out["summary"]["meta"]
+
+
+
 # ---------------------------------------------------------------------------
 # removeBlock: the deferred splice must not use a stale index
 # ---------------------------------------------------------------------------
@@ -211,6 +287,64 @@ def test_remove_block_still_works_one_at_a_time(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# filterSettings: matching a panel title must not hide its controls
+# ---------------------------------------------------------------------------
+
+def test_settings_search_panel_title_keeps_all_rows_visible(tmp_path):
+    out = run_js("""
+        function classList() {
+          const names = new Set();
+          return {
+            toggle(name, on) { if (on) names.add(name); else names.delete(name); },
+            has(name) { return names.has(name); }
+          };
+        }
+        const rows = [
+          { textContent: 'Story Card fallback click', classList: classList() },
+          { textContent: 'Story Stage Rows row height', classList: classList() },
+        ];
+        const panel = {
+          classList: classList(),
+          querySelector(sel) {
+            return sel === '.rp-panel-head' ? { textContent: 'Control Macro Coordinates' } : null;
+          },
+          querySelectorAll(sel) { return sel === '.setting-row' ? rows : []; },
+          cloneNode() {
+            return {
+              textContent: '',
+              querySelector(sel) {
+                return sel === '.rp-panel-head' ? { remove() {} } : null;
+              },
+              querySelectorAll() { return []; },
+            };
+          },
+        };
+        const category = {
+          dataset: { cat: 'debug' }, style: {}, classList: classList(),
+          querySelectorAll(sel) { return sel === '.rp-panel' ? [panel] : []; },
+        };
+        const buttons = [
+          { dataset: { cat: 'all' }, classList: classList() },
+          { dataset: { cat: 'debug' }, classList: classList() },
+        ];
+        const document = {
+          querySelectorAll(sel) {
+            if (sel === '.settings-cat-btn') return buttons;
+            if (sel === '.settings-category') return [category];
+            return [];
+          },
+        };
+        eval(extract('filterSettings'));
+        filterSettings('Macro Coordinates');
+        console.log(JSON.stringify({
+          rowsHidden: rows.map(row => row.classList.has('search-hidden')),
+          panelHidden: panel.classList.has('search-hidden'),
+        }));
+    """, tmp_path)
+    assert out == {"rowsHidden": [False, False], "panelHidden": False}
+
+
+# ---------------------------------------------------------------------------
 # filterSettings: panel-owned content outside .setting-row stays searchable
 # ---------------------------------------------------------------------------
 
@@ -265,6 +399,37 @@ def test_settings_search_non_row_panel_content_keeps_controls_visible(tmp_path):
         }));
     """, tmp_path)
     assert out == {"rowsHidden": [False], "panelHidden": False}
+
+
+def test_webhook_progress_toggle_is_saved_with_other_webhook_settings(tmp_path):
+    out = run_js("""
+        const calls = [];
+        const elements = {
+          'webhook-url': { value: 'https://discord.com/api/webhooks/123/token' },
+          'webhook-mention-id': { value: '456' },
+          'toggle-webhook-enabled': { classList: { contains: () => true } },
+          'toggle-webhook-silent': { classList: { contains: () => false } },
+          'toggle-webhook-progress': { classList: { contains: () => true } },
+        };
+        const document = { getElementById: id => elements[id] };
+        const pywebview = { api: {
+          save_webhook_settings: async (...args) => calls.push(args),
+        }};
+        function updateWebhookValidity() {}
+        function setWebhookStatus() {}
+        eval(extract('saveWebhookSettings'));
+        (async () => {
+          await saveWebhookSettings(true);
+          console.log(JSON.stringify(calls));
+        })();
+    """, tmp_path)
+    assert out == [[
+        "https://discord.com/api/webhooks/123/token",
+        True,
+        False,
+        "456",
+        True,
+    ]]
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1196,69 @@ def test_both_dock_and_skip_release_it():
         body = src[src.index(f"function {fn}("):]
         body = body[:body.index("\n}\n") + 2]
         assert "runPendingFirstRun()" in body, f"{fn} never releases a queued first-run dialog"
+
+
+def test_show_docked_reasserts_panel_width_on_mac():
+    """macOS: docking (re)arranges the panel back to the narrow strip beside
+    Roblox, and if the user was on a non-Dashboard screen when Roblox
+    appeared (or reappeared after a relaunch) that strip leaves the
+    multi-column editor clipped -- the "Macro Manager shows nothing" report.
+    showDocked must re-assert the width the current screen needs, and only
+    on mac; a Dashboard dock (the common first-ever case) keeps the strip."""
+    src = open(os.path.join(os.path.dirname(INDEX_HTML), "app.js"), encoding="utf-8").read()
+    body = src[src.index("function showDocked("):]
+    body = body[:body.index("\n}\n") + 2]
+    assert "if (IS_MAC) {" in body, "re-assert is not gated on mac"
+    assert "set_panel_expanded(currentScreen !== 'dashboard')" in body, \
+        "showDocked never re-asserts the width a non-Dashboard screen needs"
+
+
+def test_show_docked_reasserts_panel_width_on_mac_behaviorally(tmp_path):
+    """Behavioural twin of the source-contract check above: actually run the
+    shipped showDocked() (lifted by brace-matching) against a stand-in DOM and
+    pywebview bridge, and assert the re-assert fires exactly when it should.
+    A non-Dashboard screen needs the full frame; the Dashboard keeps the strip;
+    and on Windows the call must not happen at all (the bridge method is
+    mac-only)."""
+    out = run_js("""
+        const calls = [];
+        // First dock already happened, so showDocked does not auto-hop to
+        // Dashboard and clobber currentScreen -- we want the re-assert path.
+        let hasAutoShownDashboard = true;
+        let currentScreen = 'manager';
+        function switchScreen() {}
+        function isBlockingOverlayOpen() { return false; }
+        function runPendingFirstRun() {}
+        // Any id gets a fresh {style:{}} so the three display writes land
+        // without a real DOM; show_game/hide_game are no-ops for this test.
+        global.document = { getElementById: id => ({ style: {} }) };
+        global.window = { pywebview: {} };
+        global.pywebview = { api: {
+          set_panel_expanded: v => calls.push(v),
+          show_game: () => {},
+          hide_game: () => {},
+        }};
+        global.IS_MAC = true;
+
+        eval(extract('showDocked'));
+
+        showDocked();
+        const managerCall = calls.slice();
+        calls.length = 0;
+        currentScreen = 'dashboard';
+        showDocked();
+        const dashboardCall = calls.slice();
+        calls.length = 0;
+        global.IS_MAC = false;
+        currentScreen = 'manager';
+        showDocked();
+        const nonMacCall = calls.slice();
+
+        console.log(JSON.stringify({ managerCall, dashboardCall, nonMacCall }));
+    """, tmp_path)
+    assert out["managerCall"] == [True], "non-Dashboard screen did not expand the panel on mac"
+    assert out["dashboardCall"] == [False], "Dashboard kept the narrow strip instead of collapsing the panel"
+    assert out["nonMacCall"] == [], "set_panel_expanded fired when not on mac"
 
 
 # ---------------------------------------------------------------------------

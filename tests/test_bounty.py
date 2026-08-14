@@ -12,6 +12,36 @@ def _link_text(frame, x, y, text="FlowerForest", color=(40, 210, 65)):
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
+def test_reads_card_rarity_from_card_local_title_ocr():
+    frame = _frame()
+    card = (250, 180, 200, 230)
+    lines = [{"text": "Mythic Bounty #6", "cx": 350, "cy": 230}]
+
+    assert bounty.read_card_rarity(frame, card, lines) == "mythic"
+
+
+def test_reads_non_mythic_card_rarity_from_card_local_title_ocr():
+    frame = _frame()
+    card = (250, 180, 200, 230)
+    lines = [{"text": "Legendary Bounty #2", "cx": 350, "cy": 230}]
+
+    assert bounty.read_card_rarity(frame, card, lines) == "other"
+
+
+def test_reroll_detector_accepts_only_the_gold_right_footer_control():
+    frame = _frame()
+    card = {"card": (100, 100, 200, 250)}
+    cv2.rectangle(frame, (270, 300), (295, 335), (0, 170, 220), -1)
+
+    buttons = bounty.detect_reroll_buttons(frame, [card])
+
+    assert len(buttons) == 1
+    assert buttons[0]["kind"] == "reroll"
+    assert buttons[0]["detector"] == "card_relative_gold_footer"
+    assert buttons[0]["card"] == card["card"]
+    assert 270 <= buttons[0]["cx"] <= 295
+
+
 def test_reads_remaining_bounty_counter_from_orange_mask(monkeypatch):
     frame = _frame()
     reads = iter(["", "2 / 10"])
@@ -222,6 +252,84 @@ def test_detects_green_wave_link_from_color_and_nearby_objective():
     found = bounty.detect_objectives(frame, lines)
     assert len(found) == 1
     assert found[0]["kind"] == "infinite"
+    assert found[0]["target_wave"] == 30
+
+
+def test_wave_parser_anchors_target_and_repairs_final_zero():
+    assert bounty._extract_wave_targets([
+        "Mythic Bounty #2 Clear Wave of King's Tomb",
+    ]) == []
+    assert bounty._extract_wave_targets([
+        "Mythic Bounty #2 Clear Wave 30 of King's Tomb",
+    ]) == [30]
+    assert bounty._extract_wave_targets([
+        "Clear Wave 6 of King's Tomb",
+    ]) == [60]
+    assert bounty._extract_wave_targets([
+        "Clear Wave 6C of King's Tomb",
+    ]) == [60]
+    assert bounty._extract_wave_targets([
+        "Clear Wave 60C of King's Tomb",
+    ]) == []
+
+
+def test_wave_parser_rejects_bare_single_digit_without_wave_context():
+    assert bounty._extract_wave_targets(["Clear 6"]) == []
+    assert bounty._extract_wave_targets(
+        ["Clear 6"], allow_clear_number=True) == []
+    assert bounty._extract_wave_targets(
+        ["Clear 30"], allow_clear_number=True) == [30]
+
+
+def test_wave_selection_prefers_normalized_consensus_over_20_30_swap():
+    selected = bounty._choose_wave_target([
+        ("context", ["Clear Wave 20 of King's Tomb"], 3),
+        ("local_raw", ["Clear Wave 20 of", "Clear Wave 20 of"], 2),
+        ("card_raw", ["Clear Wave 20 of"], 5),
+        ("card_contrast", ["Clear 30", "Clear 30"], 6),
+    ])
+
+    assert selected == 30
+
+
+def test_wave_selection_uses_normalized_raw_when_contrast_is_empty():
+    selected = bounty._choose_wave_target([
+        ("local_raw", ["Clear Wave 20 of", "Clear Wave 20 of"], 2),
+        ("card_raw", ["Clear Wave 30 of"], 5),
+    ])
+
+    assert selected == 30
+
+
+def test_detect_objectives_uses_card_local_wave_consensus(monkeypatch):
+    frame = _frame()
+    link = {
+        "kind": "infinite", "x": 80, "y": 100, "w": 60, "h": 10,
+        "cx": 110, "cy": 105, "visual_id": 123,
+    }
+    reads = iter([
+        "0/1", "0/1",
+        "Clear Wave 20 of", "Clear Wave 20 of",
+        "Clear Wave 20 of", "Clear Wave 20 of",
+        "Clear 30", "Clear 30",
+    ])
+    monkeypatch.setattr(bounty.ocr_windows, "ocr_lines", lambda _image: [])
+    monkeypatch.setattr(
+        bounty.ocr_windows, "ocr_image", lambda _image: next(reads))
+    monkeypatch.setattr(
+        bounty,
+        "_colored_components",
+        lambda _board, _lower, _upper, kind: [link] if kind == "infinite" else [],
+    )
+    monkeypatch.setattr(
+        bounty,
+        "detect_card_scrolls",
+        lambda _frame: [{"card": (220, 220, 200, 230)}],
+    )
+
+    found = bounty.detect_objectives(frame)
+
+    assert len(found) == 1
     assert found[0]["target_wave"] == 30
 
 

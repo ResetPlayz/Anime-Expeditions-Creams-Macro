@@ -95,6 +95,101 @@ def get_pytesseract():
     )
 
 
+def smoke_test_text_reader() -> tuple[bool, str]:
+    """Verify that one OCR engine can actually recognize generated text.
+
+    Import/package checks are not enough: pytesseract can import while the
+    native tesseract.exe is missing, and a broken Windows OCR projection can
+    return empty strings for every call. Health Check uses this as a real
+    end-to-end probe.
+    """
+    sample = np.full((80, 260, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        sample, "OCR 123", (18, 54), cv2.FONT_HERSHEY_SIMPLEX,
+        1.4, (0, 0, 0), 3, cv2.LINE_AA,
+    )
+
+    from core import ocr_windows
+    if ocr_windows.is_available():
+        text = ocr_windows.ocr_image(sample)
+        if any(ch.isalnum() for ch in text):
+            backend = ocr_windows.backend_name() or "Windows OCR"
+            return True, f"using {backend} ({text.strip()!r})"
+        detail = ocr_windows.unavailable_reason()
+        return False, (
+            "Windows OCR loaded but recognized no text"
+            + (f" ({detail})" if detail else "")
+        )
+
+    try:
+        pytesseract = get_pytesseract()
+        text = pytesseract.image_to_string(sample, config="--psm 7").strip()
+    except Exception as exc:
+        detail = ocr_windows.unavailable_reason()
+        return False, (
+            "Windows OCR unavailable"
+            + (f" ({detail})" if detail else "")
+            + f"; Tesseract failed: {exc}"
+        )
+    if any(ch.isalnum() for ch in text):
+        return True, f"using Tesseract ({text!r})"
+    return False, "Tesseract ran but recognized no text"
+
+
+_rapidocr_engine = None  # None = not checked yet, False = unavailable
+
+
+def reset_rapidocr_cache() -> None:
+    """Clear the optional RapidOCR singleton, mainly for tests."""
+    global _rapidocr_engine
+    _rapidocr_engine = None
+
+
+def get_rapidocr():
+    """Return a cached RapidOCR engine, or None when the optional package is unavailable.
+
+    rapidocr_onnxruntime currently ships ch_PP-OCRv4 models. We do not claim
+    English-only loading here; callers should post-process for their expected
+    character set, such as digit-only challenge text.
+    """
+    global _rapidocr_engine
+    if _rapidocr_engine is not None:
+        return _rapidocr_engine or None
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _rapidocr_engine = RapidOCR()
+    except Exception:
+        _rapidocr_engine = False
+    return _rapidocr_engine or None
+
+
+def _rapidocr_text(img: np.ndarray, whitelist: str = None) -> str:
+    """Best-effort RapidOCR pass. Returns '' on miss/error so callers can fall back."""
+    engine = get_rapidocr()
+    if engine is None or img is None or img.size == 0:
+        return ""
+    try:
+        if not img.flags["C_CONTIGUOUS"]:
+            img = np.ascontiguousarray(img)
+        if img.ndim == 2:
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        result, _elapsed = engine(rgb_img)
+    except Exception:
+        return ""
+    if not result:
+        return ""
+    text = " ".join(str(line[1]) for line in result if len(line) >= 2 and line[1])
+    if whitelist:
+        text = "".join(c for c in text if c in whitelist or c.isspace())
+    return text.strip()
+
+
+def is_rapidocr_available() -> bool:
+    return get_rapidocr() is not None
+
+
 from . import mss_manager
 
 
@@ -111,6 +206,45 @@ def capture_region(left: int, top: int, width: int, height: int) -> np.ndarray:
     return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
 
+def capture_region_from_window(hwnd: int, x: int, y: int, width: int, height: int) -> np.ndarray:
+    """Capture a game-client-space rect from the window's OWN backing store.
+
+    A plain screen grab (capture_region) reads whatever happens to be on
+    screen at those coordinates. On macOS the game is a separate top-level
+    window that the expanded panel can sit directly on top of (see
+    main.Api.set_panel_expanded), so a screen grab there would read the
+    panel's pixels instead of the game. This reuses vision's window-content
+    capture -- PrintWindow on Windows, CGWindowListCreateImage on macOS, see
+    core.vision.capture_window_region_bgr -- which reads the window even when
+    it is occluded. The region is in the same reference/client space every
+    settings-calibrated OCR crop already uses, and the result is BGR exactly
+    like capture_region, so downstream OCR code is unchanged.
+
+    Returns None if the window could not be rendered; callers that need a
+    guaranteed image should treat that as a failed capture.
+    """
+    from . import vision
+    # Same max(1, ...) floor the screen-space twin (capture_region) applies:
+    # a zero/negative width or height would make vision's crop an empty
+    # array, and sample_color_matches_window would then average nothing
+    # (NaN -> False) instead of sampling a pixel. Unreachable through the
+    # fixed scrollbar probe, but settings-provided regions can drift.
+    return vision.capture_window_region_bgr(
+        hwnd, (int(x), int(y), max(1, int(width)), max(1, int(height)))
+    )
+
+
+def _patch_matches_color(patch: np.ndarray, expected_rgb_hex: int, tolerance: int) -> bool:
+    """Shared color-averaging check for the sample_color_matches pair."""
+    b, g, r = patch.reshape(-1, 3).mean(axis=0)
+    expected_r = (expected_rgb_hex >> 16) & 0xFF
+    expected_g = (expected_rgb_hex >> 8) & 0xFF
+    expected_b = expected_rgb_hex & 0xFF
+    return (abs(r - expected_r) <= tolerance and
+            abs(g - expected_g) <= tolerance and
+            abs(b - expected_b) <= tolerance)
+
+
 def sample_color_matches(left: int, top: int, width: int, height: int,
                           expected_rgb_hex: int, tolerance: int = 20) -> bool:
     """Grabs a small screen-space patch and checks whether its average color
@@ -120,13 +254,21 @@ def sample_color_matches(left: int, top: int, width: int, height: int,
     Averaged over the patch instead of a single pixel so antialiasing/
     compression noise at the sampled point doesn't cause a false miss."""
     patch = capture_region(left, top, max(1, width), max(1, height))
-    b, g, r = patch.reshape(-1, 3).mean(axis=0)
-    expected_r = (expected_rgb_hex >> 16) & 0xFF
-    expected_g = (expected_rgb_hex >> 8) & 0xFF
-    expected_b = expected_rgb_hex & 0xFF
-    return (abs(r - expected_r) <= tolerance and
-            abs(g - expected_g) <= tolerance and
-            abs(b - expected_b) <= tolerance)
+    return _patch_matches_color(patch, expected_rgb_hex, tolerance)
+
+
+def sample_color_matches_window(hwnd: int, x: int, y: int, width: int, height: int,
+                                expected_rgb_hex: int, tolerance: int = 20) -> bool:
+    """Window-content twin of sample_color_matches, in game-client space.
+
+    Same averaging and tolerance, but over a region read from the window's
+    own backing store -- for macOS's side-by-side layout where the expanded
+    panel can cover Roblox (see capture_region_from_window).
+    """
+    patch = capture_region_from_window(hwnd, x, y, width, height)
+    if patch is None:
+        return False
+    return _patch_matches_color(patch, expected_rgb_hex, tolerance)
 
 
 def candidate_masks(cell_bgr: np.ndarray, upscale: int = 6, sharpen_amount: float = 1.5) -> list:
@@ -201,22 +343,29 @@ def _whitelist_from_config(base_config: str) -> str:
 
 
 def ocr_mask(pytesseract, mask: np.ndarray, base_config: str = "", whitelist: str = None) -> str:
-    """One OCR pass over one prepared mask, engine-agnostic: Windows OCR
-    when available (core.ocr_windows), else Tesseract. Windows output is
-    filtered to the whitelist (explicit arg, or parsed from base_config)
-    so both engines yield the same character set; Tesseract uses the
-    config as-is. Callers do their own regex/scoring on the result."""
+    """One OCR pass over one prepared mask: optional RapidOCR, Windows OCR, then Tesseract.
+
+    Windows OCR output is filtered to the explicit whitelist, or to the
+    tessedit_char_whitelist parsed from base_config when no explicit whitelist
+    is passed. This preserves stats/wave/shop callers that depend on Tesseract
+    config style whitelists while using Windows OCR.
+    """
+    wl = whitelist if whitelist is not None else _whitelist_from_config(base_config)
+
+    text = _rapidocr_text(mask, wl)
+    if text:
+        return text
+
     from core import ocr_windows
     if ocr_windows.is_available():
         text = ocr_windows.ocr_image(mask)
-        wl = whitelist if whitelist is not None else _whitelist_from_config(base_config)
         if wl:
             text = "".join(c for c in text if c in wl or c.isspace())
-        return text.strip()
+        if text.strip():
+            return text.strip()
     if pytesseract is None:
         return ""
     return pytesseract.image_to_string(mask, config=base_config).strip()
-
 
 def ocr_best(pytesseract, cell_bgr: np.ndarray, base_config: str,
              psm_modes: tuple = (7, 8), valid_pattern=None) -> str:

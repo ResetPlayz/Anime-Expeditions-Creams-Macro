@@ -142,13 +142,49 @@ def _record_capture(white_at=None):
     return capture_window, seen
 
 
+def _patch_place_capture(monkeypatch, capture):
+    """Keep placement geometry tests deterministic on either platform."""
+    monkeypatch.setattr("core.runner_blocks.vision.capture_window_region_bgr", capture)
+    monkeypatch.setattr(
+        "core.ocr.capture_region",
+        lambda left, top, width, height: capture(123, (left, top, width, height)),
+    )
+
+
+def test_mac_scan_uses_screen_capture_for_transient_placement_highlight(monkeypatch):
+    """macOS's window image can omit Roblox's cursor-driven placement glow."""
+    import numpy as np
+    from core import ocr, runner_blocks
+
+    calls = []
+
+    def capture_screen(left, top, width, height):
+        calls.append((left, top, width, height))
+        patch = np.zeros((height, width, 3), np.uint8)
+        patch[height // 2, width // 2] = (255, 255, 255)
+        return patch
+
+    monkeypatch.setattr(runner_blocks.sys, "platform", "darwin")
+    monkeypatch.setattr(ocr, "capture_region", capture_screen)
+    monkeypatch.setattr(
+        runner_blocks.vision,
+        "capture_window_region_bgr",
+        lambda *_args: pytest.fail("macOS placement scans must use the composed screen capture"),
+    )
+
+    result = _ScanRunner()._scan_place_search_box(123, 100, 200, 400, 400)
+
+    assert result == (0, 0)
+    assert calls == [(481, 581, 38, 38)]
+
+
 @pytest.mark.parametrize("spot", [
     (5, 400), (400, 3), (1149, 400), (400, 753), (2, 2), (1150, 754), (576, 378),
 ])
 def test_scan_box_never_reads_outside_the_window(spot, monkeypatch):
     from core.config import FIXED_WIN_H, FIXED_WIN_W
     capture, seen = _record_capture()
-    monkeypatch.setattr("core.runner_blocks.vision.capture_window_region_bgr", capture)
+    _patch_place_capture(monkeypatch, capture)
 
     _ScanRunner()._scan_place_search_box(123, 0, 0, *spot)
 
@@ -161,7 +197,7 @@ def test_scan_box_does_not_accept_a_white_pixel_outside_the_window(monkeypatch):
     # x=5 used to capture x=-14..24; a white pixel at x=-6 is the macro's own
     # panel, and was returned as a placement tile at offset (-11, 0).
     capture, _ = _record_capture(white_at=(-6, 400))
-    monkeypatch.setattr("core.runner_blocks.vision.capture_window_region_bgr", capture)
+    _patch_place_capture(monkeypatch, capture)
     assert _ScanRunner()._scan_place_search_box(123, 0, 0, 5, 400) is None
 
 
@@ -176,7 +212,7 @@ def test_scan_box_offset_is_measured_from_the_requested_spot(spot, white, expect
     caller asked about -- not the middle of whatever region got captured. Get
     this wrong and every placement near an edge lands somewhere else."""
     capture, _ = _record_capture(white_at=white)
-    monkeypatch.setattr("core.runner_blocks.vision.capture_window_region_bgr", capture)
+    _patch_place_capture(monkeypatch, capture)
     assert _ScanRunner()._scan_place_search_box(123, 0, 0, *spot) == expected
 
 
@@ -404,3 +440,230 @@ def test_legacy_auto_upgrade_block_still_uses_click_mode(monkeypatch):
         (300, 400),
         (10, 20),
     ]
+
+
+def test_auto_upgrade_click_waits_for_a_slow_info_panel(monkeypatch):
+    """The panel can still be rendering AUTO_UPGRADE_CLICK_SETTLE after the
+    unit is clicked -- a unit placed while a wave spawns was reported missing
+    that one check and logging "not found" against a panel that showed up right
+    afterwards. Keep looking until it does."""
+    from core import runner_blocks
+    import threading
+
+    runner = _AutoUpgradeRunner("g")
+    monkeypatch.setattr(runner_blocks.wm, "get_window_rect_screen",
+                        lambda hwnd: (0, 0, 1152, 756))
+    monkeypatch.setattr(runner_blocks.time, "sleep", lambda seconds: None)
+
+    attempts = []
+
+    def slow_panel(*a, **k):
+        attempts.append(1)
+        if len(attempts) < 3:
+            return (None, None)
+        return ({"cx": 300, "cy": 400, "score": 0.99}, "priority_upgrade")
+
+    monkeypatch.setattr(runner_blocks.vision, "find_image_any", slow_panel)
+
+    block = {
+        "type": "auto_upgrade_unit",
+        "params": {"index": 1, "priority": 2, "input": "click"},
+    }
+    assert runner._run_auto_upgrade_unit_tick(123, threading.Event(), block, 1) is True
+
+    assert len(attempts) == 3, "gave up instead of waiting for the panel"
+    assert [item.args for item in runner._mouse.click.call_args_list] == [
+        (100, 200),   # select the unit
+        (300, 400),   # cycle to priority 2
+        (300, 400),
+        (10, 20),     # close the info panel
+    ]
+    assert not any("not found" in message for message in runner.logs)
+
+
+def test_auto_upgrade_click_gives_up_when_the_panel_never_opens(monkeypatch):
+    """Waiting must be bounded -- a panel that genuinely never opens still has
+    to end the block rather than poll forever, and must not cycle anything."""
+    from core import runner_blocks
+    import threading
+
+    runner = _AutoUpgradeRunner("g")
+    monkeypatch.setattr(runner_blocks.wm, "get_window_rect_screen",
+                        lambda hwnd: (0, 0, 1152, 756))
+    monkeypatch.setattr(runner_blocks.time, "sleep", lambda seconds: None)
+    ticks = iter([step * 0.5 for step in range(200)])
+    monkeypatch.setattr(runner_blocks.time, "time", lambda: next(ticks))
+    monkeypatch.setattr(runner_blocks.vision, "find_image_any",
+                        lambda *a, **k: (None, None))
+
+    block = {
+        "type": "auto_upgrade_unit",
+        "params": {"index": 1, "priority": 2, "input": "click"},
+    }
+    assert runner._run_auto_upgrade_unit_tick(123, threading.Event(), block, 1) is True
+
+    assert any("not found on the info panel" in message for message in runner.logs)
+    assert [item.args for item in runner._mouse.click.call_args_list] == [(100, 200)]
+
+
+# ---------------------------------------------------------------------------
+# Navigation recovery: gamemode card search widening
+# ---------------------------------------------------------------------------
+
+class _CardRunner:
+    """Just enough runner for _find_gamemode_card."""
+
+    def __init__(self, boxed, wide):
+        self._boxed, self._wide = boxed, wide
+        self.searches = []
+        self.logs = []
+
+    _find_gamemode_card = None  # bound below
+
+    def _log(self, msg):
+        self.logs.append(msg)
+
+
+def _make_card_runner(boxed, wide):
+    from core.runner import MacroRunner
+    r = _CardRunner(boxed, wide)
+    r._find_gamemode_card = MacroRunner._find_gamemode_card.__get__(r, _CardRunner)
+    return r
+
+
+def _patch_card_search(monkeypatch, runner):
+    from core import runner as runner_mod
+
+    def wait_for_image_any(hwnd, names, region=None, timeout=None, stop_event=None):
+        runner.searches.append("boxed" if region else "wide")
+        # Mirrors the real helper: (None, None) when nothing matched.
+        found = runner._boxed if region else runner._wide
+        return (found, "expedition") if found is not None else (None, None)
+
+    monkeypatch.setattr(runner_mod.vision, "wait_for_image_any", wait_for_image_any)
+
+
+def test_gamemode_card_found_in_the_panel_never_widens(monkeypatch):
+    """The boxed search exists to keep the 3D viewport out of the search --
+    a hit there must not trigger a second, wider scan."""
+    import threading
+
+    runner = _make_card_runner(boxed={"cx": 700, "cy": 200, "score": 0.98}, wide=None)
+    _patch_card_search(monkeypatch, runner)
+
+    match, _ = runner._find_gamemode_card(1, threading.Event(), ("expedition",), "Expedition")
+    assert match is not None
+    assert runner.searches == ["boxed"]
+
+
+def test_gamemode_card_outside_the_panel_is_still_found(monkeypatch):
+    """The menu has gained cards (Tower, Event), so a mode can render outside
+    GAMEMODE_CARD_REGION. That used to fail the whole task."""
+    import threading
+
+    runner = _make_card_runner(boxed=None, wide={"cx": 120, "cy": 640, "score": 0.95})
+    _patch_card_search(monkeypatch, runner)
+
+    match, _ = runner._find_gamemode_card(1, threading.Event(), ("expedition",), "Expedition")
+    assert match is not None, "a card outside the box must still be found"
+    assert runner.searches == ["boxed", "wide"]
+    assert any("widening" in m for m in runner.logs)
+
+
+def test_gamemode_card_genuinely_absent_reports_nothing(monkeypatch):
+    import threading
+
+    runner = _make_card_runner(boxed=None, wide=None)
+    _patch_card_search(monkeypatch, runner)
+
+    match, name = runner._find_gamemode_card(1, threading.Event(), ("expedition",), "Expedition")
+    assert (match, name) == (None, None)
+    assert runner.searches == ["boxed", "wide"]
+
+
+def test_gamemode_card_does_not_widen_after_a_stop(monkeypatch):
+    """Stop must not be followed by another 5s scan."""
+    import threading
+
+    runner = _make_card_runner(boxed=None, wide={"cx": 1, "cy": 1, "score": 1.0})
+    _patch_card_search(monkeypatch, runner)
+
+    stop = threading.Event()
+    stop.set()
+    runner._find_gamemode_card(1, stop, ("expedition",), "Expedition")
+    assert runner.searches == ["boxed"]
+
+
+# ---------------------------------------------------------------------------
+# AFK Chamber: click out instead of polling a dead screen
+# ---------------------------------------------------------------------------
+
+class _AfkRunner:
+    def __init__(self, match=None, raises=False):
+        self._match, self._raises = match, raises
+        self._mouse = MagicMock()
+        self.logs = []
+        self.searches = 0
+
+    _dismiss_afk_chamber = None  # bound below
+
+    def _log(self, msg):
+        self.logs.append(msg)
+
+    def _set_status(self, **kw):
+        pass
+
+
+def _make_afk_runner(match=None, raises=False, monkeypatch=None):
+    from core import runner as runner_mod
+    from core.runner import MacroRunner
+
+    r = _AfkRunner(match, raises)
+    r._dismiss_afk_chamber = MacroRunner._dismiss_afk_chamber.__get__(r, _AfkRunner)
+
+    def find_image(hwnd, name, region=None, **kw):
+        r.searches += 1
+        if r._raises:
+            raise runner_mod.vision.TemplateNotFound(name)
+        return r._match
+
+    monkeypatch.setattr(runner_mod.vision, "find_image", find_image)
+    monkeypatch.setattr(runner_mod.wm, "get_window_rect_screen", lambda hwnd: (10, 20, 1152, 756))
+    return r
+
+
+def test_afk_chamber_is_clicked_out_of(monkeypatch):
+    from core.runner_constants import AFK_CHAMBER_EXIT_CLICK
+
+    r = _make_afk_runner(match={"cx": 576, "cy": 44, "score": 0.99}, monkeypatch=monkeypatch)
+    at = r._dismiss_afk_chamber(1, 0.0)
+
+    assert r._mouse.click.call_args.args == (10 + AFK_CHAMBER_EXIT_CLICK[0],
+                                             20 + AFK_CHAMBER_EXIT_CLICK[1])
+    assert at > 0.0, "the click time must be returned so the cooldown can start"
+    assert any("AFK Chamber" in m for m in r.logs)
+
+
+def test_afk_chamber_absent_does_nothing(monkeypatch):
+    r = _make_afk_runner(match=None, monkeypatch=monkeypatch)
+    assert r._dismiss_afk_chamber(1, 0.0) == 0.0
+    r._mouse.click.assert_not_called()
+
+
+def test_afk_chamber_without_a_reference_image_is_skipped(monkeypatch):
+    """Optional check: a missing afk_chamber.png must not break a run."""
+    r = _make_afk_runner(raises=True, monkeypatch=monkeypatch)
+    assert r._dismiss_afk_chamber(1, 0.0) == 0.0
+    r._mouse.click.assert_not_called()
+
+
+def test_afk_chamber_is_not_reclicked_inside_the_cooldown(monkeypatch):
+    """The banner lingers while the exit animates -- clicking every poll would
+    fight the transition the first click started."""
+    import time as _time
+
+    r = _make_afk_runner(match={"cx": 576, "cy": 44, "score": 0.99}, monkeypatch=monkeypatch)
+    just_now = _time.time()
+    assert r._dismiss_afk_chamber(1, just_now) == just_now
+    r._mouse.click.assert_not_called()
+    assert r.searches == 0, "the cooldown should short-circuit before searching"
