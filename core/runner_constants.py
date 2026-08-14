@@ -371,7 +371,7 @@ PRIORITY_UPGRADE_IMAGE_NAMES = ("priority_upgrade",)
 # (or, if the client fully closed, relaunches) straight into this specific
 # experience instead of leaving the run stuck on a Reconnect prompt forever.
 PLACE_ID = "84515722934860"
-REJOIN_DEEPLINK = f"roblox://experiences/start?placeId={PLACE_ID}"
+REJOIN_DEEPLINK = f"roblox-player://experiences/start?placeId={PLACE_ID}"
 
 # Project links surfaced as link buttons on the match-result webhook (see
 # runner._send_result_webhook) -- the community Discord, the source repo,
